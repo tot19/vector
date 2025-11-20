@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use metrics::{counter, histogram};
-pub use vector_lib::internal_event::EventsReceived;
+
 use vector_lib::internal_event::{
     ComponentEventsDropped, InternalEvent, UNINTENTIONAL, error_stage, error_type,
 };
