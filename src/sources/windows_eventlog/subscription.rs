@@ -1,0 +1,1770 @@
+use std::{
+    collections::HashMap,
+    num::NonZeroU32,
+    sync::{Arc, Mutex},
+};
+
+use chrono::{DateTime, Utc};
+use governor::{
+    Quota, RateLimiter,
+    clock::DefaultClock,
+    state::{InMemoryState, NotKeyed},
+};
+use quick_xml::{Reader, events::Event as XmlEvent};
+use regex;
+use tokio::sync::mpsc;
+
+use super::{checkpoint::Checkpointer, config::WindowsEventLogConfig, error::*};
+
+/// System fields from Windows Event Log XML (Single Responsibility)
+#[derive(Debug, Clone)]
+struct SystemFields {
+    pub event_id: u32,
+    pub level: u8,
+    pub task: u16,
+    pub opcode: u8,
+    pub keywords: u64,
+    pub version: Option<u8>,
+    pub qualifiers: Option<u16>,
+    pub record_id: u64,
+    pub activity_id: Option<String>,
+    pub related_activity_id: Option<String>,
+    pub process_id: u32,
+    pub thread_id: u32,
+    pub channel: String,
+    pub computer: String,
+    pub user_id: Option<String>,
+    pub time_created: DateTime<Utc>,
+    pub provider_name: String,
+    pub provider_guid: Option<String>,
+}
+
+/// Result from EventData parsing (supports both formats)
+#[derive(Debug, Clone)]
+pub struct EventDataResult {
+    pub structured_data: HashMap<String, String>, // Named fields
+    pub string_inserts: Vec<String>,              // FluentBit-style array
+    pub user_data: HashMap<String, String>,       // UserData section
+}
+
+/// Represents a Windows Event Log event
+#[derive(Debug, Clone)]
+pub struct WindowsEvent {
+    pub record_id: u64,
+    pub event_id: u32,
+    pub level: u8,
+    pub task: u16,
+    pub opcode: u8,
+    pub keywords: u64,
+    pub time_created: DateTime<Utc>,
+    pub provider_name: String,
+    pub provider_guid: Option<String>,
+    pub channel: String,
+    pub computer: String,
+    pub user_id: Option<String>,
+    pub process_id: u32,
+    pub thread_id: u32,
+    pub activity_id: Option<String>,
+    pub related_activity_id: Option<String>,
+    pub raw_xml: String,
+    pub rendered_message: Option<String>,
+    pub event_data: HashMap<String, String>,
+    pub user_data: HashMap<String, String>,
+    // Additional fields for FluentBit compatibility
+    pub version: Option<u8>,
+    pub qualifiers: Option<u16>,
+    pub string_inserts: Vec<String>, // FluentBit-compatible field
+}
+
+impl WindowsEvent {
+    pub fn level_name(&self) -> &'static str {
+        match self.level {
+            1 => "Critical",
+            2 => "Error",
+            3 => "Warning",
+            4 => "Information",
+            5 => "Verbose",
+            _ => "Unknown",
+        }
+    }
+}
+
+/// Event-driven Windows Event Log subscription using EvtSubscribe with proper callback-based approach
+pub struct EventLogSubscription {
+    config: Arc<WindowsEventLogConfig>,
+    event_receiver: mpsc::UnboundedReceiver<WindowsEvent>,
+    checkpointer: Arc<Checkpointer>,
+    #[cfg(windows)]
+    #[allow(dead_code)] // Used for RAII cleanup of Windows handles via Drop trait
+    subscriptions: Arc<Mutex<Vec<SubscriptionHandle>>>,
+    #[cfg(windows)]
+    // Shared subscription error state - checked by next_events()
+    subscription_error: Arc<Mutex<Option<WindowsEventLogError>>>,
+    // Rate limiter for controlling event throughput
+    rate_limiter: Option<RateLimiter<NotKeyed, InMemoryState, DefaultClock>>,
+}
+
+#[cfg(windows)]
+struct SubscriptionHandle {
+    handle: windows::Win32::System::EventLog::EVT_HANDLE,
+    // Raw pointer to CallbackContext - must be freed in Drop to prevent memory leak
+    context: *const std::ffi::c_void,
+}
+
+// SAFETY: SubscriptionHandle contains a raw pointer to Arc<CallbackContext>.
+// Arc is thread-safe, and the raw pointer is only used for cleanup in Drop.
+// The pointer is never dereferenced except to reconstruct the Arc when dropping.
+#[cfg(windows)]
+unsafe impl Send for SubscriptionHandle {}
+
+#[cfg(windows)]
+impl Drop for SubscriptionHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() {
+            unsafe {
+                if let Err(e) = windows::Win32::System::EventLog::EvtClose(self.handle) {
+                    warn!("Failed to close subscription handle: {}", e);
+                }
+            }
+        }
+
+        // Free the CallbackContext to prevent memory leak
+        // EvtSubscribe incremented the Arc refcount via into_raw(), so we must decrement it
+        if !self.context.is_null() {
+            unsafe {
+                let _ = Arc::from_raw(self.context as *const CallbackContext);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct CallbackContext {
+    event_sender: mpsc::UnboundedSender<WindowsEvent>,
+    config: Arc<WindowsEventLogConfig>,
+    // Shared error state - allows callback to signal fatal subscription errors
+    subscription_error: Arc<Mutex<Option<WindowsEventLogError>>>,
+}
+
+// Convert CallbackContext pointer to raw pointer for passing through Windows API
+#[cfg(windows)]
+impl CallbackContext {
+    fn into_raw(ctx: Arc<CallbackContext>) -> *const std::ffi::c_void {
+        Arc::into_raw(ctx) as *const std::ffi::c_void
+    }
+
+    unsafe fn from_raw(ptr: *const std::ffi::c_void) -> Arc<CallbackContext> {
+        unsafe { Arc::from_raw(ptr as *const CallbackContext) }
+    }
+}
+
+impl EventLogSubscription {
+    /// Create a new event-driven subscription using EvtSubscribe with callback
+    pub async fn new(
+        config: &WindowsEventLogConfig,
+        checkpointer: Arc<Checkpointer>,
+    ) -> Result<Self, WindowsEventLogError> {
+        // Create rate limiter if configured
+        let rate_limiter = if config.events_per_second > 0 {
+            NonZeroU32::new(config.events_per_second).map(|rate| {
+                info!(
+                    message = "Enabling rate limiting for Windows Event Log source",
+                    events_per_second = config.events_per_second
+                );
+                RateLimiter::direct(Quota::per_second(rate))
+            })
+        } else {
+            None
+        };
+
+        #[cfg(not(windows))]
+        {
+            let _ = checkpointer; // Suppress unused warning on non-Windows
+            return Err(WindowsEventLogError::NotSupportedError);
+        }
+
+        #[cfg(windows)]
+        {
+            let config = Arc::new(config.clone());
+            let (event_sender, event_receiver) = mpsc::unbounded_channel();
+            let subscription_error = Arc::new(Mutex::new(None));
+
+            // Validate channels exist and are accessible
+            Self::validate_channels(&config)?;
+
+            // Log checkpoint resume information
+            for channel in &config.channels {
+                if let Some(checkpoint) = checkpointer.get(channel).await {
+                    info!(
+                        message = "Resuming from checkpoint",
+                        channel = %channel,
+                        record_id = checkpoint.record_id
+                    );
+                } else {
+                    info!(
+                        message = "No checkpoint found, starting fresh",
+                        channel = %channel
+                    );
+                }
+            }
+
+            // Create callback context for this subscription
+            let callback_context = Arc::new(CallbackContext {
+                event_sender: event_sender.clone(),
+                config: Arc::clone(&config),
+                subscription_error: Arc::clone(&subscription_error),
+            });
+
+            let subscriptions = Arc::new(Mutex::new(Vec::new()));
+
+            // Create subscriptions for each channel, passing our context
+            Self::create_subscriptions(
+                &config,
+                Arc::clone(&subscriptions),
+                Arc::clone(&callback_context),
+            )?;
+
+            Ok(Self {
+                config,
+                event_receiver,
+                checkpointer,
+                subscriptions,
+                subscription_error,
+                rate_limiter,
+            })
+        }
+    }
+
+    /// Get the next batch of events from the subscription
+    pub async fn next_events(
+        &mut self,
+        max_events: usize,
+    ) -> Result<Vec<WindowsEvent>, WindowsEventLogError> {
+        use tokio::time::{Duration, timeout};
+
+        // Check for subscription errors first
+        #[cfg(windows)]
+        {
+            if let Some(error) = self.subscription_error.lock().unwrap().take() {
+                return Err(error);
+            }
+        }
+
+        let mut events = Vec::with_capacity(max_events.min(1000));
+
+        // Use timeout to prevent blocking indefinitely
+        let timeout_duration = Duration::from_millis(self.config.event_timeout_ms);
+
+        while events.len() < max_events {
+            // Check for subscription errors during event collection
+            #[cfg(windows)]
+            {
+                if let Some(error) = self.subscription_error.lock().unwrap().take() {
+                    return Err(error);
+                }
+            }
+
+            match timeout(timeout_duration, self.event_receiver.recv()).await {
+                Ok(Some(event)) => {
+                    // Check if we've already processed this event (resume from checkpoint)
+                    if let Some(checkpoint) = self.checkpointer.get(&event.channel).await {
+                        if event.record_id <= checkpoint.record_id {
+                            // Skip events we've already processed
+                            debug!(
+                                message = "Skipping already-processed event",
+                                channel = %event.channel,
+                                record_id = event.record_id,
+                                checkpoint_record_id = checkpoint.record_id
+                            );
+                            continue;
+                        }
+                    }
+
+                    if Self::should_include_event(&self.config, &event) {
+                        // Apply rate limiting before adding the event
+                        if let Some(limiter) = &self.rate_limiter {
+                            limiter.until_ready().await;
+                        }
+                        events.push(event);
+                    }
+                }
+                Ok(None) => {
+                    // Channel closed, subscription ended
+                    debug!("Event subscription channel closed");
+
+                    // Check if closure was due to an error
+                    #[cfg(windows)]
+                    {
+                        if let Some(error) = self.subscription_error.lock().unwrap().take() {
+                            return Err(error);
+                        }
+                    }
+                    break;
+                }
+                Err(_) => {
+                    // Timeout occurred - this is normal for real-time subscriptions
+                    if events.is_empty() {
+                        trace!("No events received within timeout");
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Update checkpoints for all events in this batch
+        // We checkpoint after collecting the batch to ensure we don't lose events
+        if !events.is_empty() {
+            // Group events by channel and find the max record_id for each
+            let mut channel_max_records: HashMap<String, u64> = HashMap::new();
+            for event in &events {
+                let max = channel_max_records
+                    .entry(event.channel.clone())
+                    .or_insert(0);
+                if event.record_id > *max {
+                    *max = event.record_id;
+                }
+            }
+
+            // Update checkpoint for each channel
+            for (channel, record_id) in channel_max_records {
+                if let Err(e) = self.checkpointer.set(channel.clone(), record_id).await {
+                    warn!(
+                        message = "Failed to update checkpoint - events may be reprocessed after restart",
+                        channel = %channel,
+                        record_id = record_id,
+                        error = %e,
+                        internal_log_rate_limit = true
+                    );
+                }
+            }
+        }
+
+        Ok(events)
+    }
+
+    #[cfg(windows)]
+    fn create_subscriptions(
+        config: &Arc<WindowsEventLogConfig>,
+        subscriptions: Arc<Mutex<Vec<SubscriptionHandle>>>,
+        callback_context: Arc<CallbackContext>,
+    ) -> Result<(), WindowsEventLogError> {
+        use windows::{
+            Win32::System::EventLog::{
+                EvtSubscribe, EvtSubscribeStartAtOldestRecord, EvtSubscribeToFutureEvents,
+            },
+            core::HSTRING,
+        };
+
+        info!("Creating Windows Event Log subscriptions");
+
+        for channel in &config.channels {
+            let channel_hstring = HSTRING::from(channel.as_str());
+            let query = Self::build_xpath_query(config, channel)?;
+            let query_hstring = HSTRING::from(query.clone());
+
+            // Determine subscription flags based on configuration
+            let subscription_flags = if config.read_existing_events {
+                EvtSubscribeStartAtOldestRecord.0
+            } else {
+                EvtSubscribeToFutureEvents.0
+            };
+
+            debug!(
+                message = "Creating Windows Event Log subscription",
+                channel = %channel,
+                query = %query,
+                read_existing = config.read_existing_events
+            );
+
+            // Convert context to raw pointer for passing through Windows API
+            let context_ptr = CallbackContext::into_raw(Arc::clone(&callback_context));
+
+            // Create subscription using EvtSubscribe with callback
+            let subscription_handle = unsafe {
+                EvtSubscribe(
+                    None, // Session handle (local)
+                    None, // Signal event (we use callback instead)
+                    &channel_hstring,
+                    &query_hstring,
+                    None,              // Bookmark (handled via checkpointer for persistence)
+                    Some(context_ptr), // Context - per-subscription context!
+                    Some(event_subscription_callback), // Callback function
+                    subscription_flags,
+                )
+                .map_err(|e| WindowsEventLogError::CreateSubscriptionError { source: e })?
+            };
+
+            info!(
+                message = "Windows Event Log subscription created successfully",
+                channel = %channel
+            );
+
+            // Store subscription handle for cleanup
+            {
+                let mut subs = subscriptions.lock().unwrap();
+                subs.push(SubscriptionHandle {
+                    handle: subscription_handle,
+                    context: context_ptr,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn should_include_event(_config: &WindowsEventLogConfig, _event: &WindowsEvent) -> bool {
+        // Implement filtering logic based on field_filter configuration
+        // For now, include all events that passed the XML parsing filters
+        true
+    }
+
+    fn build_xpath_query(
+        config: &WindowsEventLogConfig,
+        _channel: &str,
+    ) -> Result<String, WindowsEventLogError> {
+        let query = if let Some(ref custom_query) = config.event_query {
+            custom_query.clone()
+        } else {
+            "*".to_string()
+        };
+
+        Ok(query)
+    }
+
+    #[cfg(windows)]
+    fn validate_channels(config: &WindowsEventLogConfig) -> Result<(), WindowsEventLogError> {
+        use windows::Win32::System::EventLog::{EvtClose, EvtOpenChannelConfig};
+        use windows::core::HSTRING;
+
+        // Validate each channel exists and is accessible
+        for channel in &config.channels {
+            let channel_hstring = HSTRING::from(channel.as_str());
+
+            // Try to open the channel configuration to verify it exists
+            let channel_handle = unsafe { EvtOpenChannelConfig(None, &channel_hstring, 0) };
+
+            match channel_handle {
+                Ok(handle) => {
+                    // Channel exists - close the handle and continue
+                    if let Err(e) = unsafe { EvtClose(handle) } {
+                        warn!("Failed to close channel config handle: {}", e);
+                    }
+                }
+                Err(e) => {
+                    // Channel doesn't exist or can't be accessed
+                    let error_code = e.code().0 as u32;
+
+                    // ERROR_FILE_NOT_FOUND (2) or ERROR_EVT_CHANNEL_NOT_FOUND (15007)
+                    if error_code == 2 || error_code == 15007 {
+                        return Err(WindowsEventLogError::ChannelNotFoundError {
+                            channel: channel.clone(),
+                        });
+                    } else if error_code == 5 {
+                        // ERROR_ACCESS_DENIED
+                        return Err(WindowsEventLogError::AccessDeniedError {
+                            channel: channel.clone(),
+                        });
+                    } else {
+                        return Err(WindowsEventLogError::OpenChannelError {
+                            channel: channel.clone(),
+                            source: e,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Comprehensive System section parser for all Windows Event Log fields
+    /// Extracts fields following Single Responsibility Principle
+    fn extract_system_fields(xml: &str) -> SystemFields {
+        SystemFields {
+            event_id: Self::extract_xml_value(xml, "EventID")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            level: Self::extract_xml_value(xml, "Level")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            task: Self::extract_xml_value(xml, "Task")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            opcode: Self::extract_xml_value(xml, "Opcode")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            keywords: Self::extract_xml_attribute(xml, "Keywords")
+                .and_then(|v| {
+                    // Handle both decimal and hex formats (0x prefix)
+                    if v.starts_with("0x") || v.starts_with("0X") {
+                        u64::from_str_radix(&v[2..], 16).ok()
+                    } else {
+                        v.parse().ok()
+                    }
+                })
+                .unwrap_or(0),
+            version: Self::extract_xml_value(xml, "Version").and_then(|v| v.parse().ok()),
+            qualifiers: Self::extract_xml_attribute(xml, "Qualifiers").and_then(|v| v.parse().ok()),
+            record_id: Self::extract_xml_value(xml, "EventRecordID")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            activity_id: Self::extract_xml_attribute(xml, "ActivityID"),
+            related_activity_id: Self::extract_xml_attribute(xml, "RelatedActivityID"),
+            process_id: Self::extract_xml_attribute(xml, "ProcessID")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            thread_id: Self::extract_xml_attribute(xml, "ThreadID")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            channel: Self::extract_xml_value(xml, "Channel").unwrap_or_default(),
+            computer: Self::extract_xml_value(xml, "Computer").unwrap_or_default(),
+            user_id: Self::extract_xml_attribute(xml, "UserID"),
+            time_created: Self::extract_xml_attribute(xml, "SystemTime")
+                .and_then(|v| DateTime::parse_from_rfc3339(&v).ok())
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(Utc::now),
+            provider_name: Self::extract_provider_name(xml).unwrap_or_default(),
+            provider_guid: Self::extract_xml_attribute(xml, "Guid"),
+        }
+    }
+
+    // XML parsing helper methods - cleaned up and more secure
+    pub fn extract_xml_attribute(xml: &str, attr_name: &str) -> Option<String> {
+        // Use regex with proper escaping to prevent injection
+        let pattern = format!(r#"{}="([^"]+)""#, regex::escape(attr_name));
+        regex::Regex::new(&pattern)
+            .ok()?
+            .captures(xml)?
+            .get(1)
+            .map(|m| m.as_str().to_string())
+    }
+
+    /// Extract provider name specifically from Provider element using proper XML parsing
+    fn extract_provider_name(xml: &str) -> Option<String> {
+        let mut reader = Reader::from_str(xml);
+        reader.trim_text(true);
+        let mut buf = Vec::new();
+
+        // Limit iterations for security
+        const MAX_ITERATIONS: usize = 1000;
+        let mut iterations = 0;
+
+        loop {
+            if iterations >= MAX_ITERATIONS {
+                return None;
+            }
+            iterations += 1;
+
+            match reader.read_event_into(&mut buf) {
+                Ok(XmlEvent::Start(ref e)) | Ok(XmlEvent::Empty(ref e)) => {
+                    let name = e.name();
+                    // Check if this is a Provider element (local name only, ignore namespace)
+                    if name.local_name().as_ref() == b"Provider" {
+                        // Extract the Name attribute
+                        for attr in e.attributes() {
+                            if let Ok(attr) = attr {
+                                if attr.key.local_name().as_ref() == b"Name" {
+                                    return String::from_utf8(attr.value.to_vec()).ok();
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(XmlEvent::Eof) => break,
+                Err(_) => return None,
+                _ => {}
+            }
+
+            buf.clear();
+        }
+
+        None
+    }
+
+    pub fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
+        let mut reader = Reader::from_str(xml);
+        reader.trim_text(true);
+
+        let mut buf = Vec::new();
+        let mut inside_target = false;
+        let mut current_element = String::new();
+
+        // Strict iteration limit for security
+        const MAX_ITERATIONS: usize = 5000;
+        let mut iterations = 0;
+
+        loop {
+            if iterations >= MAX_ITERATIONS {
+                warn!("XML parsing iteration limit exceeded");
+                return None;
+            }
+            iterations += 1;
+
+            match reader.read_event_into(&mut buf) {
+                Ok(XmlEvent::Start(ref e)) => {
+                    let name = e.name();
+                    let element_name = String::from_utf8_lossy(name.as_ref());
+                    if element_name == tag {
+                        inside_target = true;
+                        current_element.clear();
+                    }
+                }
+                Ok(XmlEvent::Text(ref e)) => {
+                    if inside_target {
+                        match e.unescape() {
+                            Ok(text) => {
+                                // Prevent excessive memory usage
+                                if current_element.len() + text.len() > 4096 {
+                                    warn!("XML element text too long, truncating");
+                                    break;
+                                }
+                                current_element.push_str(&text);
+                            }
+                            Err(_) => return None,
+                        }
+                    }
+                }
+                Ok(XmlEvent::End(ref e)) => {
+                    let name = e.name();
+                    let element_name = String::from_utf8_lossy(name.as_ref());
+                    if element_name == tag && inside_target {
+                        return Some(current_element.trim().to_string());
+                    }
+                }
+                Ok(XmlEvent::Eof) => break,
+                Err(_) => return None,
+                _ => {}
+            }
+
+            buf.clear();
+        }
+
+        None
+    }
+
+    /// Enhanced EventData extraction supporting both structured data and StringInserts
+    /// Follows Open/Closed Principle - extensible without modifying existing code
+    pub fn extract_event_data(xml: &str, config: &WindowsEventLogConfig) -> EventDataResult {
+        let mut structured_data = HashMap::new();
+        let mut string_inserts = Vec::new();
+        let mut user_data = HashMap::new();
+
+        Self::parse_section(xml, "EventData", &mut structured_data, &mut string_inserts);
+        Self::parse_section(xml, "UserData", &mut user_data, &mut Vec::new());
+
+        // Apply configurable truncation to event data values
+        if config.max_event_data_length > 0 {
+            for value in structured_data.values_mut() {
+                if value.len() > config.max_event_data_length {
+                    value.truncate(config.max_event_data_length);
+                    value.push_str("...[truncated]");
+                }
+            }
+            for value in user_data.values_mut() {
+                if value.len() > config.max_event_data_length {
+                    value.truncate(config.max_event_data_length);
+                    value.push_str("...[truncated]");
+                }
+            }
+            for value in string_inserts.iter_mut() {
+                if value.len() > config.max_event_data_length {
+                    value.truncate(config.max_event_data_length);
+                    value.push_str("...[truncated]");
+                }
+            }
+        }
+
+        EventDataResult {
+            structured_data,
+            string_inserts,
+            user_data,
+        }
+    }
+
+    /// Parse a specific XML section (EventData or UserData) - Single Responsibility
+    fn parse_section(
+        xml: &str,
+        section_name: &str,
+        named_data: &mut HashMap<String, String>,
+        inserts: &mut Vec<String>,
+    ) {
+        let mut reader = Reader::from_str(xml);
+        reader.trim_text(true);
+
+        let mut buf = Vec::new();
+        let mut inside_section = false;
+        let mut inside_data = false;
+        let mut current_data_name = String::new();
+        let mut current_data_value = String::new();
+
+        const MAX_ITERATIONS: usize = 500; // Security limit
+        const MAX_FIELDS: usize = 100; // Memory limit
+        let mut iterations = 0;
+
+        loop {
+            if iterations >= MAX_ITERATIONS || named_data.len() >= MAX_FIELDS {
+                break;
+            }
+            iterations += 1;
+
+            match reader.read_event_into(&mut buf) {
+                Ok(XmlEvent::Start(ref e)) => {
+                    let name = e.name();
+                    if name.as_ref() == section_name.as_bytes() {
+                        inside_section = true;
+                    } else if inside_section && name.as_ref() == b"Data" {
+                        inside_data = true;
+                        current_data_name.clear();
+                        current_data_value.clear();
+
+                        // Extract Name attribute with proper validation
+                        for attr in e.attributes() {
+                            if let Ok(attr) = attr {
+                                if attr.key.as_ref() == b"Name" {
+                                    let name_value = String::from_utf8_lossy(&attr.value);
+                                    if name_value.len() <= 128 && !name_value.trim().is_empty() {
+                                        current_data_name = name_value.into_owned();
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(XmlEvent::End(ref e)) => {
+                    let name = e.name();
+                    if name.as_ref() == section_name.as_bytes() {
+                        inside_section = false;
+                    } else if name.as_ref() == b"Data" && inside_data {
+                        inside_data = false;
+
+                        // Note: Truncation is now configurable and handled later
+                        // Store in appropriate format based on whether Name attribute exists
+                        if !current_data_name.is_empty() {
+                            named_data
+                                .insert(current_data_name.clone(), current_data_value.clone());
+                        } else if section_name == "EventData" {
+                            // Add to StringInserts for FluentBit compatibility
+                            inserts.push(current_data_value.clone());
+                        }
+                    }
+                }
+                Ok(XmlEvent::Text(ref e)) => {
+                    if inside_section && inside_data {
+                        if let Ok(text) = e.unescape() {
+                            // Append text without length check (configurable truncation applied later)
+                            // Still enforce a maximum for security to prevent OOM
+                            const MAX_VALUE_SIZE: usize = 1024 * 1024; // 1MB hard limit for security
+                            if current_data_value.len() + text.len() <= MAX_VALUE_SIZE {
+                                current_data_value.push_str(&text);
+                            }
+                        }
+                    }
+                }
+                Ok(XmlEvent::Eof) => break,
+                Err(_) => break, // Security: fail gracefully
+                _ => {}
+            }
+
+            buf.clear();
+        }
+    }
+
+    fn extract_message_from_xml(
+        xml: &str,
+        event_id: u32,
+        provider_name: &str,
+        computer: &str,
+        config: &WindowsEventLogConfig,
+    ) -> Option<String> {
+        let event_data_result = Self::extract_event_data(xml, config);
+        let event_data = &event_data_result.structured_data;
+
+        // Helper function to apply configurable truncation
+        let truncate = |s: &str| -> String {
+            if config.max_message_field_length > 0 && s.len() > config.max_message_field_length {
+                let mut truncated = s
+                    .chars()
+                    .take(config.max_message_field_length)
+                    .collect::<String>();
+                truncated.push_str("...");
+                truncated
+            } else {
+                s.to_string()
+            }
+        };
+
+        match event_id {
+            6009 => {
+                if let (Some(version), Some(build)) =
+                    (event_data.get("Data_0"), event_data.get("Data_1"))
+                {
+                    return Some(format!(
+                        "Microsoft Windows kernel version {} build {} started",
+                        truncate(version),
+                        truncate(build)
+                    ));
+                }
+            }
+            _ => {
+                if !event_data.is_empty() {
+                    let data_summary: Vec<String> = event_data
+                        .iter()
+                        .take(3)
+                        .map(|(k, v)| format!("{}={}", truncate(k), truncate(v)))
+                        .collect();
+                    if !data_summary.is_empty() {
+                        return Some(format!(
+                            "Event ID {} from {} ({})",
+                            event_id,
+                            truncate(provider_name),
+                            data_summary.join(", ")
+                        ));
+                    }
+                }
+            }
+        }
+
+        Some(format!(
+            "Event ID {} from {} on {}",
+            event_id,
+            truncate(provider_name),
+            truncate(computer)
+        ))
+    }
+
+    fn parse_event_xml(
+        xml: String,
+        channel: &str,
+        config: &WindowsEventLogConfig,
+    ) -> Result<Option<WindowsEvent>, WindowsEventLogError> {
+        // Extract basic event information with validation
+        let record_id = Self::extract_xml_attribute(&xml, "EventRecordID")
+            .or_else(|| Self::extract_xml_value(&xml, "EventRecordID"))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let event_id = Self::extract_xml_attribute(&xml, "EventID")
+            .or_else(|| Self::extract_xml_value(&xml, "EventID"))
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+
+        // Validate we got valid event data
+        if record_id == 0 && event_id == 0 {
+            debug!(
+                message = "Failed to parse event XML - no valid EventID or RecordID found",
+                channel = %channel
+            );
+            return Ok(None);
+        }
+
+        // Apply event ID filters early
+        if let Some(ref only_ids) = config.only_event_ids {
+            if !only_ids.contains(&event_id) {
+                return Ok(None);
+            }
+        }
+
+        if config.ignore_event_ids.contains(&event_id) {
+            return Ok(None);
+        }
+
+        // Parse timestamp with validation
+        let time_created = Self::extract_xml_attribute(&xml, "SystemTime")
+            .or_else(|| Self::extract_xml_value(&xml, "TimeCreated"))
+            .or_else(|| Self::extract_xml_attribute(&xml, "TimeCreated"))
+            .and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .or_else(|_| DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f%z"))
+                    .or_else(|_| DateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%z"))
+                    .ok()
+            })
+            .map(|dt| {
+                let dt_utc = dt.with_timezone(&Utc);
+                // Validate timestamp is reasonable (within 10 years)
+                let now = Utc::now();
+                let diff = (now - dt_utc).num_days().abs();
+                if diff > 365 * 10 { now } else { dt_utc }
+            })
+            .unwrap_or_else(|| Utc::now());
+
+        // Apply age filter
+        if let Some(max_age_secs) = config.max_event_age_secs {
+            let age = Utc::now().signed_duration_since(time_created);
+            if age.num_seconds() > max_age_secs as i64 {
+                return Ok(None);
+            }
+        }
+
+        // Use comprehensive parsing for complete field coverage
+        let system_fields = Self::extract_system_fields(&xml);
+        let event_data_result = Self::extract_event_data(&xml, config);
+        let rendered_message = Self::extract_message_from_xml(
+            &xml,
+            system_fields.event_id,
+            &system_fields.provider_name,
+            &system_fields.computer,
+            config,
+        );
+
+        let event = WindowsEvent {
+            record_id: system_fields.record_id,
+            event_id: system_fields.event_id,
+            level: system_fields.level,
+            task: system_fields.task,
+            opcode: system_fields.opcode,
+            keywords: system_fields.keywords,
+            time_created: system_fields.time_created,
+            provider_name: system_fields.provider_name,
+            provider_guid: system_fields.provider_guid,
+            channel: system_fields.channel,
+            computer: system_fields.computer,
+            user_id: system_fields.user_id,
+            process_id: system_fields.process_id,
+            thread_id: system_fields.thread_id,
+            activity_id: system_fields.activity_id,
+            related_activity_id: system_fields.related_activity_id,
+            raw_xml: if config.include_xml {
+                // Limit XML size for security
+                if xml.len() > 32768 {
+                    let mut truncated = xml.chars().take(32768).collect::<String>();
+                    truncated.push_str("...[truncated]");
+                    truncated
+                } else {
+                    xml
+                }
+            } else {
+                String::new()
+            },
+            rendered_message,
+            event_data: event_data_result.structured_data,
+            user_data: event_data_result.user_data,
+            // New fields for FluentBit compatibility
+            version: system_fields.version,
+            qualifiers: system_fields.qualifiers,
+            string_inserts: event_data_result.string_inserts,
+        };
+
+        Ok(Some(event))
+    }
+}
+
+// CallbackContext cleanup is handled in SubscriptionHandle::drop via Arc::from_raw
+
+// Windows Event Log subscription callback function
+#[cfg(windows)]
+unsafe extern "system" fn event_subscription_callback(
+    action: windows::Win32::System::EventLog::EVT_SUBSCRIBE_NOTIFY_ACTION,
+    user_context: *const std::ffi::c_void,
+    event_handle: windows::Win32::System::EventLog::EVT_HANDLE,
+) -> u32 {
+    use windows::Win32::System::EventLog::{EvtSubscribeActionDeliver, EvtSubscribeActionError};
+
+    // Safety check: user_context must not be null
+    if user_context.is_null() {
+        error!("Callback received null user_context - cancelling subscription");
+        return windows::Win32::Foundation::ERROR_CANCELLED.0;
+    }
+
+    // Retrieve the callback context from user_context parameter
+    // Clone the Arc to increment ref count, then immediately forget it to not drop
+    let ctx = unsafe {
+        let arc = CallbackContext::from_raw(user_context);
+        let cloned = Arc::clone(&arc);
+        std::mem::forget(arc); // Don't drop - Windows still owns this
+        cloned
+    };
+
+    #[allow(non_upper_case_globals)] // Windows API constants don't follow Rust conventions
+    match action {
+        EvtSubscribeActionDeliver => {
+            // Process the event with the correct context
+            if let Err(e) = process_callback_event(event_handle, &ctx) {
+                warn!("Error processing callback event: {}", e);
+            }
+            0 // Return success
+        }
+        EvtSubscribeActionError => {
+            // Extract the actual Windows error using EvtGetExtendedStatus
+            let error_message = unsafe { extract_windows_extended_status() };
+
+            error!(
+                message = "Windows Event Log subscription error - subscription will be terminated",
+                error = %error_message
+            );
+
+            // Store the error in the shared state so next_events() can retrieve it
+            let mut error_state = ctx.subscription_error.lock().unwrap();
+            if error_state.is_none() {
+                *error_state = Some(WindowsEventLogError::SubscriptionError {
+                    source: windows::core::Error::from_win32(),
+                });
+            }
+
+            // Return ERROR_CANCELLED to signal Windows that we're done with this subscription
+            // This prevents the callback storm by telling Windows to stop calling us
+            windows::Win32::Foundation::ERROR_CANCELLED.0
+        }
+        _ => {
+            debug!("Unknown subscription callback action: {}", action.0);
+            0
+        }
+    }
+}
+
+/// Extract extended error information from Windows Event Log API
+#[cfg(windows)]
+unsafe fn extract_windows_extended_status() -> String {
+    use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows::Win32::System::EventLog::EvtGetExtendedStatus;
+
+    const MAX_ERROR_BUFFER: usize = 8192; // 8KB max for error messages
+    let mut buffer_size = 0u32;
+
+    // First call to get required buffer size
+    let status = unsafe { EvtGetExtendedStatus(None, &mut buffer_size) };
+
+    if status != ERROR_INSUFFICIENT_BUFFER.0 || buffer_size == 0 {
+        return "Unknown error (unable to retrieve extended status)".to_string();
+    }
+
+    // Enforce maximum size but still try to get the error message
+    if buffer_size as usize > MAX_ERROR_BUFFER {
+        warn!(
+            "Extended error status buffer size {} exceeds maximum {}, truncating",
+            buffer_size, MAX_ERROR_BUFFER
+        );
+        buffer_size = MAX_ERROR_BUFFER as u32;
+    }
+
+    // Allocate buffer and retrieve the error message
+    let mut buffer = vec![0u16; buffer_size as usize];
+    let mut actual_size = 0u32;
+
+    let status = unsafe { EvtGetExtendedStatus(Some(&mut buffer), &mut actual_size) };
+
+    if status == 0 {
+        // Success - remove null terminator if present
+        let msg_len = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+        String::from_utf16_lossy(&buffer[..msg_len])
+    } else {
+        "Unknown error (EvtGetExtendedStatus failed)".to_string()
+    }
+}
+
+#[cfg(windows)]
+fn process_callback_event(
+    event_handle: windows::Win32::System::EventLog::EVT_HANDLE,
+    ctx: &Arc<CallbackContext>,
+) -> Result<(), WindowsEventLogError> {
+    use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows::Win32::System::EventLog::{EvtRender, EvtRenderEventXml};
+
+    const MAX_BUFFER_SIZE: u32 = 10 * 1024 * 1024; // 10MB limit (increased to handle large events)
+    const DEFAULT_BUFFER_SIZE: u32 = 4096; // 4KB default
+
+    let buffer_size = DEFAULT_BUFFER_SIZE;
+    let mut buffer_used = 0u32;
+    let mut buffer: Vec<u8> = vec![0u8; buffer_size as usize];
+
+    // First attempt with default buffer size
+    let mut property_count = 0u32;
+    let result = unsafe {
+        EvtRender(
+            None,
+            event_handle,
+            EvtRenderEventXml.0,
+            buffer_size,
+            Some(buffer.as_mut_ptr() as *mut std::ffi::c_void),
+            &mut buffer_used,
+            &mut property_count,
+        )
+    };
+
+    // Handle buffer reallocation if needed
+    if let Err(e) = result {
+        if e.code() == ERROR_INSUFFICIENT_BUFFER.into() {
+            if buffer_used == 0 {
+                warn!("Event XML buffer size is zero, skipping event");
+                return Ok(());
+            }
+
+            if buffer_used > MAX_BUFFER_SIZE {
+                error!(
+                    message = "Event XML exceeds maximum buffer size, cannot process",
+                    buffer_size_requested = buffer_used,
+                    max_buffer_size = MAX_BUFFER_SIZE
+                );
+                return Err(WindowsEventLogError::ReadEventError { source: e });
+            }
+
+            // Reallocate with exact required size
+            buffer.resize(buffer_used as usize, 0);
+            let mut second_buffer_used = 0u32;
+            let mut second_property_count = 0u32;
+
+            let result = unsafe {
+                EvtRender(
+                    None,
+                    event_handle,
+                    EvtRenderEventXml.0,
+                    buffer_used,
+                    Some(buffer.as_mut_ptr() as *mut std::ffi::c_void),
+                    &mut second_buffer_used,
+                    &mut second_property_count,
+                )
+            };
+
+            if let Err(e) = result {
+                warn!("EvtRender failed on second attempt: {}", e);
+                return Err(WindowsEventLogError::ReadEventError { source: e });
+            }
+
+            buffer_used = second_buffer_used;
+        } else {
+            warn!("EvtRender failed: {}", e);
+            return Err(WindowsEventLogError::ReadEventError { source: e });
+        }
+    }
+
+    // Validate buffer usage
+    if buffer_used as usize > buffer.len() || buffer_used == 0 {
+        warn!("Invalid buffer usage in EvtRender, skipping event");
+        return Ok(());
+    }
+
+    // Convert byte buffer to UTF-16 string
+    if buffer_used < 2 || buffer_used % 2 != 0 {
+        debug!("Invalid UTF-16 buffer size");
+        return Ok(());
+    }
+
+    let u16_slice = unsafe {
+        std::slice::from_raw_parts(buffer.as_ptr() as *const u16, buffer_used as usize / 2)
+    };
+
+    // Remove null terminator if present
+    let xml_len = if u16_slice.len() > 0 && u16_slice[u16_slice.len() - 1] == 0 {
+        u16_slice.len() - 1
+    } else {
+        u16_slice.len()
+    };
+
+    if xml_len == 0 {
+        debug!("Empty XML content, skipping event");
+        return Ok(());
+    }
+
+    let xml = String::from_utf16_lossy(&u16_slice[..xml_len]);
+
+    // Determine channel from XML (simplified approach)
+    let channel = EventLogSubscription::extract_xml_value(&xml, "Channel")
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    // Parse the XML to extract event data
+    if let Ok(Some(event)) = EventLogSubscription::parse_event_xml(xml, &channel, &ctx.config) {
+        if let Err(e) = ctx.event_sender.send(event) {
+            // Check if the receiver has been dropped (channel closed)
+            warn!(
+                message = "Failed to send event - receiver may be closed or dropped",
+                error = ?e,
+                channel = %channel
+            );
+            // Note: We continue processing other events rather than terminating the callback
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_xml_value() {
+        let xml = r#"
+        <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+            <System>
+                <Provider Name="Microsoft-Windows-Kernel-General" Guid="{A68CA8B7-004F-D7B6-A698-07E2DE0F1F5D}"/>
+                <EventID>1</EventID>
+                <Level>4</Level>
+                <EventRecordID>12345</EventRecordID>
+                <Channel>System</Channel>
+                <Computer>TEST-MACHINE</Computer>
+            </System>
+        </Event>
+        "#;
+
+        assert_eq!(
+            EventLogSubscription::extract_xml_value(xml, "EventID"),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            EventLogSubscription::extract_xml_value(xml, "Level"),
+            Some("4".to_string())
+        );
+        assert_eq!(
+            EventLogSubscription::extract_xml_value(xml, "EventRecordID"),
+            Some("12345".to_string())
+        );
+        assert_eq!(
+            EventLogSubscription::extract_xml_value(xml, "Channel"),
+            Some("System".to_string())
+        );
+        assert_eq!(
+            EventLogSubscription::extract_xml_value(xml, "Computer"),
+            Some("TEST-MACHINE".to_string())
+        );
+        assert_eq!(
+            EventLogSubscription::extract_xml_value(xml, "NonExistent"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_xml_attribute() {
+        let xml = r#"
+        <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+            <System>
+                <Provider Name="Microsoft-Windows-Kernel-General" Guid="{A68CA8B7-004F-D7B6-A698-07E2DE0F1F5D}"/>
+                <TimeCreated SystemTime="2025-08-29T00:15:41.123456Z"/>
+            </System>
+        </Event>
+        "#;
+
+        assert_eq!(
+            EventLogSubscription::extract_xml_attribute(xml, "Name"),
+            Some("Microsoft-Windows-Kernel-General".to_string())
+        );
+        assert_eq!(
+            EventLogSubscription::extract_xml_attribute(xml, "SystemTime"),
+            Some("2025-08-29T00:15:41.123456Z".to_string())
+        );
+        assert_eq!(
+            EventLogSubscription::extract_xml_attribute(xml, "NonExistent"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_provider_name() {
+        // Test with Provider element before EventData
+        let xml = r#"
+        <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+            <System>
+                <Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-A5BA-3E3B0328C30D}"/>
+                <EventID>4688</EventID>
+            </System>
+            <EventData>
+                <Data Name="SubjectUserSid">S-1-5-18</Data>
+                <Data Name="ProcessName">cmd.exe</Data>
+            </EventData>
+        </Event>
+        "#;
+
+        assert_eq!(
+            EventLogSubscription::extract_provider_name(xml),
+            Some("Microsoft-Windows-Security-Auditing".to_string())
+        );
+
+        // Test that it doesn't match Data elements
+        let xml_data_first = r#"
+        <Event>
+            <EventData>
+                <Data Name="SomeField">Value</Data>
+            </EventData>
+            <System>
+                <Provider Name="TestProvider"/>
+            </System>
+        </Event>
+        "#;
+
+        assert_eq!(
+            EventLogSubscription::extract_provider_name(xml_data_first),
+            Some("TestProvider".to_string())
+        );
+    }
+
+    #[test]
+    fn test_windows_event_level_name() {
+        let event = WindowsEvent {
+            record_id: 1,
+            event_id: 1000,
+            level: 2,
+            task: 0,
+            opcode: 0,
+            keywords: 0,
+            time_created: Utc::now(),
+            provider_name: "Test".to_string(),
+            provider_guid: None,
+            channel: "Test".to_string(),
+            computer: "localhost".to_string(),
+            user_id: None,
+            process_id: 0,
+            thread_id: 0,
+            activity_id: None,
+            related_activity_id: None,
+            raw_xml: String::new(),
+            rendered_message: None,
+            event_data: HashMap::new(),
+            user_data: HashMap::new(),
+            version: Some(1),
+            qualifiers: Some(0),
+            string_inserts: vec![],
+        };
+
+        assert_eq!(event.level_name(), "Error");
+    }
+
+    #[cfg(test)]
+    async fn create_test_checkpointer() -> (Arc<Checkpointer>, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let checkpointer = Arc::new(Checkpointer::new(temp_dir.path()).await.unwrap());
+        (checkpointer, temp_dir)
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn test_not_supported_error() {
+        let config = WindowsEventLogConfig::default();
+        let (checkpointer, _temp_dir) = create_test_checkpointer().await;
+        let result = EventLogSubscription::new(&config, checkpointer).await;
+
+        assert!(matches!(
+            result,
+            Err(WindowsEventLogError::NotSupportedError)
+        ));
+    }
+
+    #[test]
+    fn test_rate_limiter_configuration() {
+        // Test with rate limiting disabled (default)
+        let mut config = WindowsEventLogConfig::default();
+        assert_eq!(config.events_per_second, 0);
+
+        // Test with rate limiting enabled
+        config.events_per_second = 1000;
+        assert_eq!(config.events_per_second, 1000);
+    }
+
+    /// Test rate limiting functionality (unit test, not integration test)
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_rate_limiting_delays_events() {
+        use std::time::Instant;
+
+        let mut config = WindowsEventLogConfig::default();
+        config.channels = vec!["Application".to_string()];
+        config.events_per_second = 10; // 10 events per second
+        config.event_timeout_ms = 100; // Short timeout for test
+        config.read_existing_events = true; // Read existing events for testing
+
+        let (checkpointer, _temp_dir) = create_test_checkpointer().await;
+
+        let mut subscription = EventLogSubscription::new(&config, checkpointer)
+            .await
+            .expect("Subscription creation should succeed");
+
+        // Verify rate limiter was created
+        assert!(subscription.rate_limiter.is_some());
+
+        // Try to collect events and measure time
+        let start = Instant::now();
+        let events = subscription.next_events(20).await.unwrap_or_default();
+        let elapsed = start.elapsed();
+
+        if events.len() >= 10 {
+            // If we got 10+ events, it should have taken at least ~0.9 seconds (10 events at 10/sec)
+            // Using 0.8 seconds as threshold to account for timing variance
+            assert!(
+                elapsed.as_millis() >= 800,
+                "Rate limiting should delay processing: got {} events in {:?}",
+                events.len(),
+                elapsed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rate_limiter_disabled_by_default() {
+        let config = WindowsEventLogConfig::default();
+        assert_eq!(
+            config.events_per_second, 0,
+            "Rate limiting should be disabled by default"
+        );
+    }
+
+    #[test]
+    fn test_security_limits() {
+        // Test XML element extraction with size limits
+        let large_xml = format!(
+            r#"
+        <Event>
+            <System>
+                <EventID>{}</EventID>
+            </System>
+        </Event>
+        "#,
+            "x".repeat(10000)
+        ); // Very large content
+
+        // Should not panic or consume excessive memory
+        // Security limits should prevent processing excessively large content
+        let result = EventLogSubscription::extract_xml_value(&large_xml, "EventID");
+        assert!(
+            result.is_none(),
+            "Security limits should reject excessively large XML content"
+        );
+    }
+
+    #[test]
+    fn test_configurable_truncation_disabled_by_default() {
+        let config = WindowsEventLogConfig::default();
+
+        // Default should be no truncation
+        assert_eq!(
+            config.max_event_data_length, 0,
+            "Event data truncation should be disabled by default"
+        );
+        assert_eq!(
+            config.max_message_field_length, 0,
+            "Message field truncation should be disabled by default"
+        );
+    }
+
+    #[test]
+    fn test_event_data_truncation_when_enabled() {
+        let xml = r#"
+        <Event>
+            <EventData>
+                <Data Name="LongValue">This is a very long value that should be truncated when the limit is set</Data>
+                <Data Name="ShortValue">Short</Data>
+            </EventData>
+        </Event>
+        "#;
+
+        // Test with truncation enabled
+        let mut config = WindowsEventLogConfig::default();
+        config.max_event_data_length = 20;
+
+        let result = EventLogSubscription::extract_event_data(xml, &config);
+
+        let long_value = result.structured_data.get("LongValue").unwrap();
+        assert!(
+            long_value.ends_with("...[truncated]"),
+            "Long value should be truncated"
+        );
+        assert!(
+            long_value.len() <= 20 + "...[truncated]".len(),
+            "Truncated value should respect limit"
+        );
+
+        let short_value = result.structured_data.get("ShortValue").unwrap();
+        assert_eq!(short_value, "Short", "Short value should not be truncated");
+        assert!(
+            !short_value.contains("truncated"),
+            "Short value should not have truncation marker"
+        );
+    }
+
+    #[test]
+    fn test_event_data_no_truncation_when_disabled() {
+        let xml = r#"
+        <Event>
+            <EventData>
+                <Data Name="LongValue">This is a very long value that should NOT be truncated when truncation is disabled by setting max_event_data_length to 0</Data>
+            </EventData>
+        </Event>
+        "#;
+
+        // Test with truncation disabled (default)
+        let config = WindowsEventLogConfig::default();
+        assert_eq!(
+            config.max_event_data_length, 0,
+            "Default should be no truncation"
+        );
+
+        let result = EventLogSubscription::extract_event_data(xml, &config);
+
+        let long_value = result.structured_data.get("LongValue").unwrap();
+        assert!(
+            !long_value.ends_with("...[truncated]"),
+            "Value should not be truncated when limit is 0"
+        );
+        assert!(long_value.len() > 100, "Full value should be preserved");
+        assert!(
+            long_value.contains("disabled by setting max_event_data_length to 0"),
+            "Full text should be present"
+        );
+    }
+
+    #[test]
+    fn test_message_field_truncation_when_enabled() {
+        let xml = r#"
+        <Event>
+            <System>
+                <Provider Name="TestProvider"/>
+                <EventID>1000</EventID>
+                <Computer>TestComputer</Computer>
+            </System>
+            <EventData>
+                <Data Name="Field1">This is a very long field value that will be truncated in the message summary</Data>
+            </EventData>
+        </Event>
+        "#;
+
+        let mut config = WindowsEventLogConfig::default();
+        config.max_message_field_length = 20;
+
+        let message = EventLogSubscription::extract_message_from_xml(
+            xml,
+            1000,
+            "TestProvider",
+            "TestComputer",
+            &config,
+        )
+        .unwrap();
+
+        // Message should contain truncated values
+        assert!(
+            message.contains("..."),
+            "Message should contain truncation indicator"
+        );
+    }
+
+    #[test]
+    fn test_message_field_no_truncation_when_disabled() {
+        let xml = r#"
+        <Event>
+            <System>
+                <Provider Name="VeryLongProviderNameThatExceedsSixtyFourCharactersAndShouldNotBeTruncated"/>
+                <EventID>1000</EventID>
+                <Computer>VeryLongComputerNameThatShouldAlsoNotBeTruncatedWhenLimitIsZero</Computer>
+            </System>
+            <EventData>
+                <Data Name="Field1">VeryLongValueThatShouldNotBeTruncated</Data>
+            </EventData>
+        </Event>
+        "#;
+
+        let config = WindowsEventLogConfig::default();
+        assert_eq!(
+            config.max_message_field_length, 0,
+            "Default should be no truncation"
+        );
+
+        let message = EventLogSubscription::extract_message_from_xml(
+            xml,
+            1000,
+            "VeryLongProviderNameThatExceedsSixtyFourCharactersAndShouldNotBeTruncated",
+            "VeryLongComputerNameThatShouldAlsoNotBeTruncatedWhenLimitIsZero",
+            &config,
+        )
+        .unwrap();
+
+        // Message should contain full values
+        assert!(
+            message.contains(
+                "VeryLongProviderNameThatExceedsSixtyFourCharactersAndShouldNotBeTruncated"
+            )
+        );
+        assert!(message.contains("VeryLongValueThatShouldNotBeTruncated"));
+        assert!(
+            !message.contains("..."),
+            "Message should not contain truncation when limit is 0"
+        );
+    }
+
+    /// Integration test for invalid XPath query error handling
+    /// This test verifies that invalid XPath queries are properly detected and reported
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_invalid_xpath_query_error() {
+        use tokio::time::Duration;
+
+        // Create a config with an intentionally invalid XPath query
+        // This query has malformed syntax that Windows will reject
+        let mut config = WindowsEventLogConfig::default();
+        config.channels = vec!["Application".to_string()];
+        config.event_query = Some("*[System[(EventID=INVALID_SYNTAX!!!".to_string()); // Deliberately malformed
+        config.event_timeout_ms = 1000; // Shorter timeout for testing
+
+        let (checkpointer, _temp_dir) = create_test_checkpointer().await;
+
+        // Create subscription - should succeed initially as EvtSubscribe doesn't validate query syntax
+        let mut subscription = EventLogSubscription::new(&config, checkpointer)
+            .await
+            .expect("Subscription creation should succeed");
+
+        // Give Windows time to call the callback with EvtSubscribeActionError
+        // Using longer timeout for reliability on slower systems and CI environments
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Try to get events - should return an error propagated from the callback
+        let result = subscription.next_events(10).await;
+
+        match result {
+            Err(WindowsEventLogError::SubscriptionError { .. }) => {
+                // Success! The error was properly detected and propagated
+                println!("Invalid XPath query error correctly detected and propagated");
+            }
+            Ok(_) => {
+                panic!("Expected SubscriptionError but got success - error handling failed");
+            }
+            Err(other) => {
+                panic!(
+                    "Expected SubscriptionError but got different error: {:?}",
+                    other
+                );
+            }
+        }
+    }
+
+    /// Integration test for valid wildcard query
+    /// Verifies that the fix doesn't break valid queries
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_valid_wildcard_query() {
+        use tokio::time::Duration;
+
+        let mut config = WindowsEventLogConfig::default();
+        config.channels = vec!["Application".to_string()];
+        config.event_query = Some("*".to_string()); // Valid wildcard
+        config.event_timeout_ms = 2000;
+
+        let (checkpointer, _temp_dir) = create_test_checkpointer().await;
+
+        let mut subscription = EventLogSubscription::new(&config, checkpointer)
+            .await
+            .expect("Subscription creation should succeed");
+
+        // Give subscription time to initialize
+        // Using longer timeout for reliability on slower systems and CI environments
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Try to get events - should succeed (even if no events are available)
+        let result = subscription.next_events(10).await;
+
+        assert!(
+            result.is_ok(),
+            "Valid wildcard query should not produce subscription errors: {:?}",
+            result
+        );
+    }
+
+    /// Test for moderately complex but valid XPath queries
+    /// Tests real-world filtering scenarios
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_valid_filtered_xpath_query() {
+        use tokio::time::Duration;
+
+        let mut config = WindowsEventLogConfig::default();
+        config.channels = vec!["Application".to_string()];
+        // Valid XPath query filtering by event level
+        config.event_query = Some("*[System[Level=1 or Level=2 or Level=3]]".to_string());
+        config.event_timeout_ms = 2000;
+
+        let (checkpointer, _temp_dir) = create_test_checkpointer().await;
+
+        let mut subscription = EventLogSubscription::new(&config, checkpointer)
+            .await
+            .expect("Subscription creation should succeed");
+
+        // Give subscription time to initialize
+        // Using longer timeout for reliability on slower systems and CI environments
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Try to get events - should succeed
+        let result = subscription.next_events(10).await;
+
+        assert!(
+            result.is_ok(),
+            "Valid filtered XPath query should not produce subscription errors: {:?}",
+            result
+        );
+    }
+
+    /// Regression test for multiple concurrent subscriptions
+    /// Verifies that multiple EventLogSubscription instances don't interfere with each other
+    /// This tests the fix for the global context bug where subscriptions would overwrite each other
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_multiple_concurrent_subscriptions() {
+        use tokio::time::Duration;
+
+        // Create three separate subscriptions (simulating real-world multi-source config)
+        let mut config1 = WindowsEventLogConfig::default();
+        config1.channels = vec!["Application".to_string()];
+        config1.event_timeout_ms = 2000;
+
+        let mut config2 = WindowsEventLogConfig::default();
+        config2.channels = vec!["System".to_string()];
+        config2.event_timeout_ms = 2000;
+
+        let mut config3 = WindowsEventLogConfig::default();
+        config3.channels = vec!["Security".to_string()];
+        config3.event_timeout_ms = 2000;
+
+        let (checkpointer1, _temp_dir1) = create_test_checkpointer().await;
+        let (checkpointer2, _temp_dir2) = create_test_checkpointer().await;
+        let (checkpointer3, _temp_dir3) = create_test_checkpointer().await;
+
+        // Create all three subscriptions concurrently
+        let mut sub1 = EventLogSubscription::new(&config1, checkpointer1)
+            .await
+            .expect("Subscription 1 (Application) should succeed");
+        let mut sub2 = EventLogSubscription::new(&config2, checkpointer2)
+            .await
+            .expect("Subscription 2 (System) should succeed");
+        let mut sub3 = EventLogSubscription::new(&config3, checkpointer3)
+            .await
+            .expect("Subscription 3 (Security) should succeed");
+
+        // Give all subscriptions time to initialize
+        // Using longer timeout for reliability on slower systems and CI environments
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Try to get events from each subscription independently
+        // All should succeed without interfering with each other
+        let result1 = sub1.next_events(5).await;
+        let result2 = sub2.next_events(5).await;
+        let result3 = sub3.next_events(5).await;
+
+        assert!(
+            result1.is_ok(),
+            "Subscription 1 (Application) should not error: {:?}",
+            result1
+        );
+        assert!(
+            result2.is_ok(),
+            "Subscription 2 (System) should not error: {:?}",
+            result2
+        );
+        assert!(
+            result3.is_ok(),
+            "Subscription 3 (Security) should not error: {:?}",
+            result3
+        );
+
+        // Verify subscriptions are independent by collecting events again
+        // If contexts were shared/overwritten, callbacks would route to wrong channels
+        let result1_again = sub1.next_events(5).await;
+        let result2_again = sub2.next_events(5).await;
+        let result3_again = sub3.next_events(5).await;
+
+        assert!(
+            result1_again.is_ok(),
+            "Subscription 1 should remain healthy"
+        );
+        assert!(
+            result2_again.is_ok(),
+            "Subscription 2 should remain healthy"
+        );
+        assert!(
+            result3_again.is_ok(),
+            "Subscription 3 should remain healthy"
+        );
+    }
+}

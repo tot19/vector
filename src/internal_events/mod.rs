@@ -141,6 +141,8 @@ mod websocket;
 mod websocket_server;
 #[cfg(feature = "transforms-window")]
 mod window;
+#[cfg(feature = "sources-windows_eventlog")]
+mod windows_eventlog;
 
 #[cfg(any(
     feature = "sources-file",
@@ -295,3 +297,5 @@ pub use self::{
     adaptive_concurrency::*, batch::*, common::*, conditions::*, encoding_transcode::*,
     heartbeat::*, http::*, open::*, process::*, socket::*, tcp::*, template::*, udp::*,
 };
+
+pub use vector_lib::internal_event::EventsReceived;
