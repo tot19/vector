@@ -53,7 +53,7 @@ jobs:
     name: (PR review) Signal pending to PR
     permissions:
       statuses: write
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     if: startsWith(github.event.review.body, '/ci-run-integration') || startsWith(github.event.review.body, '/ci-run-e2e') || contains(github.event.review.body, '/ci-run-all')
     steps:
@@ -96,7 +96,7 @@ jobs:
     needs:
       - prep-pr
       - build-test-runner
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -136,7 +136,7 @@ jobs:
     needs:
       - prep-pr
       - build-test-runner
-    runs-on: ubuntu-24.04-8core
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -173,7 +173,7 @@ jobs:
     name: Signal result to PR
     permissions:
       statuses: write
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
       - integration-tests

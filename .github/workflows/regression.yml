@@ -42,7 +42,7 @@ env:
 jobs:
 
   resolve-inputs:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     outputs:
       baseline-sha: ${{ steps.set_and_validate_shas.outputs.BASELINE_SHA }}
       comparison-sha: ${{ steps.set_and_validate_shas.outputs.COMPARISON_SHA }}
@@ -111,7 +111,7 @@ jobs:
 
   # Only run this workflow if files changed in areas that could possibly introduce a regression.
   check-source-changed:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: resolve-inputs
     outputs:
@@ -171,7 +171,7 @@ jobs:
           echo "SOURCE_CHANGED=${SOURCE_CHANGED}" >> $GITHUB_OUTPUT
 
   should-run-gate:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     needs: check-source-changed
     if: ${{ needs.check-source-changed.outputs.source_changed }}
     steps:
@@ -184,7 +184,7 @@ jobs:
 
   build-baseline:
     name: Build baseline Vector container
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     needs:
       - should-run-gate
@@ -223,7 +223,7 @@ jobs:
 
   build-comparison:
     name: Build comparison Vector container
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     needs:
       - should-run-gate

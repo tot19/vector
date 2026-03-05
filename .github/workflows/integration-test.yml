@@ -28,7 +28,7 @@ env:
 
 jobs:
   test-integration:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     if: inputs.if || github.event_name == 'workflow_dispatch'
     steps:

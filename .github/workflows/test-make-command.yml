@@ -32,7 +32,7 @@ permissions:
 
 jobs:
   run-make-command:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       CARGO_INCREMENTAL: 0

@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   publish-homebrew:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       GITHUB_TOKEN: ${{ secrets.HOMEBREW_PAT }}

@@ -13,7 +13,7 @@ env:
 jobs:
   release-build-optimized:
     name: "Release Build (optimized)"
-    runs-on: ubuntu-24.04-8core
+    runs-on: ubuntu-latest
     steps:
       - uses: colpal/actions-clean@36e6ca1abd35efe61cb60f912bd7837f67887c8a # v1.1.1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -24,7 +24,7 @@ jobs:
 
   release-build-normal:
     name: "Release Build (normal)"
-    runs-on: ubuntu-24.04-8core
+    runs-on: ubuntu-latest
     env:
       # We're not actually doing a debug build, we're just turning off the logic
       # in release-flags.sh so that we don't override the Cargo "release" profile
@@ -40,7 +40,7 @@ jobs:
 
   debug-build:
     name: "Debug Build"
-    runs-on: ubuntu-24.04-8core
+    runs-on: ubuntu-latest
     steps:
       - uses: colpal/actions-clean@36e6ca1abd35efe61cb60f912bd7837f67887c8a # v1.1.1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -51,7 +51,7 @@ jobs:
 
   debug-rebuild:
     name: "Debug Rebuild"
-    runs-on: ubuntu-24.04-8core
+    runs-on: ubuntu-latest
     steps:
       - uses: colpal/actions-clean@36e6ca1abd35efe61cb60f912bd7837f67887c8a # v1.1.1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -64,7 +64,7 @@ jobs:
 
   check:
     name: "Cargo Check"
-    runs-on: ubuntu-24.04-8core
+    runs-on: ubuntu-latest
     steps:
       - uses: colpal/actions-clean@36e6ca1abd35efe61cb60f912bd7837f67887c8a # v1.1.1
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

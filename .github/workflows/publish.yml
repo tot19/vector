@@ -29,7 +29,7 @@ env:
 jobs:
   generate-publish-metadata:
     name: Generate Publish-related Metadata
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       vector_version: ${{ steps.generate-publish-metadata.outputs.vector_version }}
@@ -176,7 +176,7 @@ jobs:
 
   deb-verify:
     name: Verify DEB Packages
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
       - generate-publish-metadata
@@ -224,7 +224,7 @@ jobs:
 
   rpm-verify:
     name: Verify RPM Packages
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
       - generate-publish-metadata
@@ -305,7 +305,7 @@ jobs:
 
   publish-docker:
     name: Publish to Docker
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     needs:
       - generate-publish-metadata
@@ -360,7 +360,7 @@ jobs:
 
   publish-s3:
     name: Publish to S3
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     needs:
       - generate-publish-metadata
@@ -394,7 +394,7 @@ jobs:
     name: Publish release to GitHub
     # We only publish to GitHub for versioned releases, not nightlies.
     if: inputs.channel == 'release'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     needs:
       - generate-publish-metadata
@@ -425,7 +425,7 @@ jobs:
 
   generate-sha256sum:
     name: Generate SHA256 checksums
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
       - generate-publish-metadata
