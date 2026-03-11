@@ -276,11 +276,17 @@ impl WindowsEventLogSource {
         let mut timeout_count: u32 = 0;
         let health_interval_timeouts = (30_000 / self.config.event_timeout_ms).max(1) as u32;
 
+        let source_start = std::time::Instant::now();
+        let mut total_events_delivered: u64 = 0;
+        let mut loop_iteration: u64 = 0;
+
         loop {
+            loop_iteration += 1;
             // Move subscription into blocking thread for WaitForMultipleObjects.
             // Ownership transfer ensures no data races between the blocking thread
             // and async code. The shutdown watcher uses a raw HANDLE value (just an
             // integer) to signal shutdown without needing access to the subscription.
+            let wait_start = std::time::Instant::now();
             let (returned_sub, wait_result) = tokio::task::spawn_blocking({
                 let sub = subscription;
                 move || {
@@ -292,12 +298,14 @@ impl WindowsEventLogSource {
             .map_err(|e| WindowsEventLogError::ConfigError {
                 message: format!("Wait task panicked: {e}"),
             })?;
+            let wait_elapsed = wait_start.elapsed();
 
             subscription = returned_sub;
 
             match wait_result {
                 WaitResult::EventsAvailable => {
                     // Pull events via spawn_blocking (EvtNext/EvtRender are blocking APIs)
+                    let pull_start = std::time::Instant::now();
                     let (returned_sub, events_result) = tokio::task::spawn_blocking({
                         let mut sub = subscription;
                         move || {
@@ -309,6 +317,7 @@ impl WindowsEventLogSource {
                     .map_err(|e| WindowsEventLogError::ConfigError {
                         message: format!("Pull task panicked: {e}"),
                     })?;
+                    let pull_elapsed = pull_start.elapsed();
 
                     subscription = returned_sub;
 
@@ -319,15 +328,20 @@ impl WindowsEventLogSource {
 
                     match events_result {
                         Ok(events) if events.is_empty() => {
+                            info!(
+                                message = "DIAG: pull_events returned empty.",
+                                iteration = loop_iteration,
+                                wait_ms = wait_elapsed.as_millis() as u64,
+                                pull_ms = pull_elapsed.as_millis() as u64,
+                                total_delivered = total_events_delivered,
+                                elapsed_total_ms = source_start.elapsed().as_millis() as u64,
+                            );
                             error_backoff = std::time::Duration::from_millis(100);
                             continue;
                         }
                         Ok(events) => {
                             error_backoff = std::time::Duration::from_millis(100);
-                            debug!(
-                                message = "Pulled Windows Event Log events.",
-                                event_count = events.len()
-                            );
+                            let pulled_count = events.len();
 
                             let (batch, receiver) =
                                 BatchNotifier::maybe_new_with_receiver(acknowledgements);
@@ -336,6 +350,7 @@ impl WindowsEventLogSource {
                             let mut total_byte_size = 0;
                             let mut channels_in_batch = std::collections::HashSet::new();
 
+                            let parse_start = std::time::Instant::now();
                             for event in events {
                                 let channel = event.channel.clone();
                                 channels_in_batch.insert(channel.clone());
@@ -360,6 +375,7 @@ impl WindowsEventLogSource {
                                     }
                                 }
                             }
+                            let parse_elapsed = parse_start.elapsed();
 
                             if !log_events.is_empty() {
                                 let count = log_events.len();
@@ -368,12 +384,23 @@ impl WindowsEventLogSource {
 
                                 // BACK PRESSURE: block here until the pipeline accepts
                                 // the batch. We don't call EvtNext again until this completes.
+                                let send_start = std::time::Instant::now();
                                 if let Err(_error) = out.send_batch(log_events).await {
                                     emit!(StreamClosedError { count });
+                                    info!(
+                                        message = "DIAG: stream closed, exiting.",
+                                        iteration = loop_iteration,
+                                        total_delivered = total_events_delivered,
+                                        elapsed_total_ms = source_start.elapsed().as_millis() as u64,
+                                    );
                                     break;
                                 }
+                                let send_elapsed = send_start.elapsed();
+
+                                total_events_delivered += count as u64;
 
                                 // Register checkpoint entry with finalizer
+                                let ckpt_start = std::time::Instant::now();
                                 let bookmarks: Vec<(String, String)> = channels_in_batch
                                     .into_iter()
                                     .filter_map(|channel| {
@@ -387,6 +414,21 @@ impl WindowsEventLogSource {
                                     let entry = FinalizerEntry { bookmarks };
                                     finalizer.finalize(entry, receiver).await;
                                 }
+                                let ckpt_elapsed = ckpt_start.elapsed();
+
+                                info!(
+                                    message = "DIAG: batch cycle complete.",
+                                    iteration = loop_iteration,
+                                    pulled = pulled_count,
+                                    parsed = count,
+                                    wait_ms = wait_elapsed.as_millis() as u64,
+                                    pull_ms = pull_elapsed.as_millis() as u64,
+                                    parse_ms = parse_elapsed.as_millis() as u64,
+                                    send_ms = send_elapsed.as_millis() as u64,
+                                    checkpoint_ms = ckpt_elapsed.as_millis() as u64,
+                                    total_delivered = total_events_delivered,
+                                    elapsed_total_ms = source_start.elapsed().as_millis() as u64,
+                                );
                             }
                         }
                         Err(e) => {
@@ -415,6 +457,13 @@ impl WindowsEventLogSource {
                 }
 
                 WaitResult::Timeout => {
+                    info!(
+                        message = "DIAG: WaitForMultipleObjects timed out (no events).",
+                        iteration = loop_iteration,
+                        wait_ms = wait_elapsed.as_millis() as u64,
+                        total_delivered = total_events_delivered,
+                        elapsed_total_ms = source_start.elapsed().as_millis() as u64,
+                    );
                     // A full wait cycle without errors means the system is healthy;
                     // reset backoff so the next transient error starts fresh.
                     error_backoff = std::time::Duration::from_millis(100);
@@ -451,7 +500,12 @@ impl WindowsEventLogSource {
                 }
 
                 WaitResult::Shutdown => {
-                    info!(message = "Windows Event Log wait received shutdown signal.");
+                    info!(
+                        message = "DIAG: shutdown signal received.",
+                        iteration = loop_iteration,
+                        total_delivered = total_events_delivered,
+                        elapsed_total_ms = source_start.elapsed().as_millis() as u64,
+                    );
                     if !acknowledgements {
                         info!(message = "Flushing bookmarks before shutdown.");
                         if let Err(e) = subscription.flush_bookmarks().await {
