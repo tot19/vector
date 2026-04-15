@@ -7,6 +7,15 @@ on:
         description: "Git ref to checkout"
         required: false
         type: string
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/sources/windows_event_log/**"
+      - "src/internal_events/windows_event_log.rs"
+      - "src/internal_events/windows.rs"
+      - "src/vector_windows.rs"
+      - "src/service.rs"
+      - ".github/workflows/unit_windows.yml"
 
 permissions:
   contents: read
