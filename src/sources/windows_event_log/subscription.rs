@@ -869,6 +869,15 @@ impl EventLogSubscription {
         self.shutdown_event.0
     }
 
+    /// Test-only accessor for the first channel's signal event handle. Used
+    /// by the lost-wakeup regression test to scope its drain-loop hook to
+    /// exactly this subscription, so it does not fire on concurrent
+    /// `pull_events` calls from other tests in the same process.
+    #[cfg(test)]
+    pub(super) fn first_channel_signal_raw(&self) -> isize {
+        self.channels[0].signal_event.0 as isize
+    }
+
     /// Returns a reference to the rate limiter, if configured.
     pub const fn rate_limiter(
         &self,
@@ -1366,17 +1375,29 @@ mod tests {
             .await
             .expect("Subscription creation should succeed");
 
+        // Capture THIS subscription's signal handle so the hook can scope
+        // itself to this test. DRAIN_STEP_HOOK is a process-global, and
+        // cargo runs tests in parallel by default; without handle-keying,
+        // a concurrent test's pull_events could trigger our one-shot
+        // hook first, flip `fired`, and SetEvent on the wrong handle.
+        let target_signal_raw = subscription.first_channel_signal_raw();
+
         // Install the drain-loop hook: every EvtNext call inside
         // pull_events fires SetEvent on the subscription's signal
         // handle. This simulates the OS signaling a fresh event
         // mid-drain, which is exactly the race window #25194 exposes.
         // The hook only needs to fire once to prove the invariant; we
-        // use an AtomicBool to keep it deterministic.
+        // use an AtomicBool to keep it deterministic. The hook is keyed
+        // to `target_signal_raw` so concurrent pull_events calls from
+        // other tests no-op here.
         let fired = StdArc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let fired = StdArc::clone(&fired);
             let hook: StdArc<dyn Fn(HANDLE) + Send + Sync> =
                 StdArc::new(move |signal: HANDLE| {
+                    if signal.0 as isize != target_signal_raw {
+                        return;
+                    }
                     if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
                         unsafe {
                             let _ = SetEvent(signal);
