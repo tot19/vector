@@ -36,9 +36,8 @@ use crate::internal_events::WindowsEventLogBookmarkError;
 /// `SetEvent` against the drain without relying on thread-timing.
 /// No-op and zero-cost in non-test builds.
 #[cfg(test)]
-static DRAIN_STEP_HOOK: std::sync::Mutex<
-    Option<std::sync::Arc<dyn Fn(HANDLE) + Send + Sync>>,
-> = std::sync::Mutex::new(None);
+static DRAIN_STEP_HOOK: std::sync::Mutex<Option<std::sync::Arc<dyn Fn(HANDLE) + Send + Sync>>> =
+    std::sync::Mutex::new(None);
 
 /// Maximum number of entries in the EvtFormatMessage result cache.
 pub const FORMAT_CACHE_CAPACITY: usize = 10_000;
@@ -1393,17 +1392,16 @@ mod tests {
         let fired = StdArc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let fired = StdArc::clone(&fired);
-            let hook: StdArc<dyn Fn(HANDLE) + Send + Sync> =
-                StdArc::new(move |signal: HANDLE| {
-                    if signal.0 as isize != target_signal_raw {
-                        return;
+            let hook: StdArc<dyn Fn(HANDLE) + Send + Sync> = StdArc::new(move |signal: HANDLE| {
+                if signal.0 as isize != target_signal_raw {
+                    return;
+                }
+                if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    unsafe {
+                        let _ = SetEvent(signal);
                     }
-                    if !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                        unsafe {
-                            let _ = SetEvent(signal);
-                        }
-                    }
-                });
+                }
+            });
             *DRAIN_STEP_HOOK.lock().unwrap() = Some(hook);
         }
 
