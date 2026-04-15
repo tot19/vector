@@ -27,9 +27,10 @@ cfg_if::cfg_if! {
 
         use futures::StreamExt;
         use vector_lib::EstimatedJsonEncodedSizeOf;
+        use vector_lib::event::LogEvent;
         use vector_lib::finalizer::OrderedFinalizer;
         use vector_lib::internal_event::{
-            ByteSize, BytesReceived, CountByteSize, InternalEventHandle as _, Protocol,
+            ByteSize, BytesReceived, CountByteSize, InternalEventHandle, Protocol,
         };
         use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
         use windows::Win32::System::Threading::GetCurrentProcess;
@@ -48,6 +49,7 @@ cfg_if::cfg_if! {
             error::WindowsEventLogError,
             parser::EventLogParser,
             subscription::{EventLogSubscription, WaitResult},
+            xml_parser::WindowsEvent,
         };
     }
 }
@@ -155,6 +157,97 @@ impl Finalizer {
             }
         }
     }
+}
+
+/// Output of the synchronous parsing/batching step.
+///
+/// Keeping this struct free of any `&EventLogSubscription` reference ensures
+/// the `run_internal` future remains `Send` even though `EventLogSubscription`
+/// is `!Sync` (and thus `&EventLogSubscription` is `!Send`).
+struct PreparedBatch {
+    log_events: Vec<LogEvent>,
+    receiver: Option<BatchStatusReceiver>,
+    /// Channel names seen in this batch, used to collect bookmark XML after send.
+    channels: std::collections::HashSet<String>,
+    byte_size: usize,
+}
+
+/// Synchronous parsing/batching step shared by the normal and speculative pull paths.
+///
+/// Parses raw Windows events, attaches batch notifiers, and accumulates
+/// per-channel membership for later bookmark collection. Returns `None` when
+/// all events fail to parse so the caller can skip async I/O entirely.
+///
+/// Intentionally **synchronous** so no `&EventLogSubscription` is held across
+/// any `.await` point. The async parts (rate limiting, pipeline send, bookmark
+/// collection, finalizer) are inlined at each call site where `subscription`
+/// is owned, keeping the `run_internal` future `Send`.
+fn prepare_event_batch(
+    events: Vec<WindowsEvent>,
+    parser: &EventLogParser,
+    acknowledgements: bool,
+) -> Option<PreparedBatch> {
+    let (batch, receiver) = BatchNotifier::maybe_new_with_receiver(acknowledgements);
+    let mut log_events = Vec::new();
+    let mut total_byte_size = 0usize;
+    let mut channels_in_batch = std::collections::HashSet::new();
+
+    for event in events {
+        let channel = event.channel.clone();
+        channels_in_batch.insert(channel.clone());
+        let event_id = event.event_id;
+        match parser.parse_event(event) {
+            Ok(mut log_event) => {
+                let byte_size = log_event.estimated_json_encoded_size_of();
+                total_byte_size += byte_size.get();
+                if let Some(ref batch) = batch {
+                    log_event = log_event.with_batch_notifier(batch);
+                }
+                log_events.push(log_event);
+            }
+            Err(e) => {
+                emit!(WindowsEventLogParseError {
+                    error: e.to_string(),
+                    channel,
+                    event_id: Some(event_id),
+                });
+            }
+        }
+    }
+    // `batch` drops here; log_events hold the remaining Arc references.
+
+    if log_events.is_empty() {
+        None
+    } else {
+        Some(PreparedBatch {
+            log_events,
+            receiver,
+            channels: channels_in_batch,
+            byte_size: total_byte_size,
+        })
+    }
+}
+
+/// Transfer ownership of `subscription` into a `spawn_blocking` task, run `f`
+/// on it, then return both the subscription and the result.
+///
+/// All blocking Windows APIs (`WaitForMultipleObjects`, `EvtNext`, `EvtRender`)
+/// must run in `spawn_blocking` to avoid stalling the async runtime. The
+/// ownership-transfer pattern ensures only one thread holds the subscription
+/// at a time, preventing data races without requiring locks.
+async fn with_subscription_blocking<F, R>(
+    subscription: EventLogSubscription,
+    f: F,
+) -> Result<(EventLogSubscription, R), WindowsEventLogError>
+where
+    F: FnOnce(EventLogSubscription) -> (EventLogSubscription, R) + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || f(subscription))
+        .await
+        .map_err(|e| WindowsEventLogError::ConfigError {
+            message: format!("Blocking subscription task panicked: {e}"),
+        })
 }
 
 /// Windows Event Log source implementation
@@ -281,41 +374,24 @@ impl WindowsEventLogSource {
             // Ownership transfer ensures no data races between the blocking thread
             // and async code. The shutdown watcher uses a raw HANDLE value (just an
             // integer) to signal shutdown without needing access to the subscription.
-            let (returned_sub, wait_result) = tokio::task::spawn_blocking({
-                let sub = subscription;
-                move || {
+            let (returned_sub, wait_result) =
+                with_subscription_blocking(subscription, move |sub| {
                     let result = sub.wait_for_events_blocking(timeout_ms);
                     (sub, result)
-                }
-            })
-            .await
-            .map_err(|e| WindowsEventLogError::ConfigError {
-                message: format!("Wait task panicked: {e}"),
-            })?;
-
+                })
+                .await?;
             subscription = returned_sub;
 
             match wait_result {
                 WaitResult::EventsAvailable => {
                     // Pull events via spawn_blocking (EvtNext/EvtRender are blocking APIs)
-                    let (returned_sub, events_result) = tokio::task::spawn_blocking({
-                        let mut sub = subscription;
-                        move || {
+                    let (returned_sub, events_result) =
+                        with_subscription_blocking(subscription, move |mut sub| {
                             let result = sub.pull_events(batch_size);
                             (sub, result)
-                        }
-                    })
-                    .await
-                    .map_err(|e| WindowsEventLogError::ConfigError {
-                        message: format!("Pull task panicked: {e}"),
-                    })?;
-
+                        })
+                        .await?;
                     subscription = returned_sub;
-
-                    // Rate limiting between batches (async-compatible)
-                    if let Some(limiter) = subscription.rate_limiter() {
-                        limiter.until_ready().await;
-                    }
 
                     match events_result {
                         Ok(events) if events.is_empty() => {
@@ -328,53 +404,30 @@ impl WindowsEventLogSource {
                                 message = "Pulled Windows Event Log events.",
                                 event_count = events.len()
                             );
-
-                            let (batch, receiver) =
-                                BatchNotifier::maybe_new_with_receiver(acknowledgements);
-
-                            let mut log_events = Vec::new();
-                            let mut total_byte_size = 0;
-                            let mut channels_in_batch = std::collections::HashSet::new();
-
-                            for event in events {
-                                let channel = event.channel.clone();
-                                channels_in_batch.insert(channel.clone());
-                                let event_id = event.event_id;
-                                match parser.parse_event(event) {
-                                    Ok(mut log_event) => {
-                                        let byte_size = log_event.estimated_json_encoded_size_of();
-                                        total_byte_size += byte_size.get();
-
-                                        if let Some(ref batch) = batch {
-                                            log_event = log_event.with_batch_notifier(batch);
-                                        }
-
-                                        log_events.push(log_event);
-                                    }
-                                    Err(e) => {
-                                        emit!(WindowsEventLogParseError {
-                                            error: e.to_string(),
-                                            channel,
-                                            event_id: Some(event_id),
-                                        });
-                                    }
-                                }
+                            // Rate limiting between batches (async-compatible).
+                            // `subscription` is owned here so &RateLimiter (Send,
+                            // since RateLimiter: Sync) is safe to hold across .await.
+                            if let Some(limiter) = subscription.rate_limiter() {
+                                limiter.until_ready().await;
                             }
+                            if let Some(prepared) =
+                                prepare_event_batch(events, &parser, acknowledgements)
+                            {
+                                let count = prepared.log_events.len();
+                                events_received
+                                    .emit(CountByteSize(count, prepared.byte_size.into()));
+                                bytes_received.emit(ByteSize(prepared.byte_size));
 
-                            if !log_events.is_empty() {
-                                let count = log_events.len();
-                                events_received.emit(CountByteSize(count, total_byte_size.into()));
-                                bytes_received.emit(ByteSize(total_byte_size));
-
-                                // BACK PRESSURE: block here until the pipeline accepts
-                                // the batch. We don't call EvtNext again until this completes.
-                                if let Err(_error) = out.send_batch(log_events).await {
+                                // BACK PRESSURE: block until the pipeline accepts the batch.
+                                // We don't call EvtNext again until this completes.
+                                if let Err(_error) = out.send_batch(prepared.log_events).await {
                                     emit!(StreamClosedError { count });
                                     break;
                                 }
 
-                                // Register checkpoint entry with finalizer
-                                let bookmarks: Vec<(String, String)> = channels_in_batch
+                                // Collect bookmark XML for each channel seen in this batch.
+                                let bookmarks: Vec<(String, String)> = prepared
+                                    .channels
                                     .into_iter()
                                     .filter_map(|channel| {
                                         subscription
@@ -382,10 +435,13 @@ impl WindowsEventLogSource {
                                             .map(|xml| (channel, xml))
                                     })
                                     .collect();
-
                                 if !bookmarks.is_empty() {
-                                    let entry = FinalizerEntry { bookmarks };
-                                    finalizer.finalize(entry, receiver).await;
+                                    finalizer
+                                        .finalize(
+                                            FinalizerEntry { bookmarks },
+                                            prepared.receiver,
+                                        )
+                                        .await;
                                 }
                             }
                         }
@@ -446,6 +502,87 @@ impl WindowsEventLogSource {
                                 message = "All channel subscriptions healthy.",
                                 total_channels = total,
                             );
+                        }
+                    }
+
+                    // Speculative pull: self-heal against any lost-wakeup scenario,
+                    // regardless of root cause. If the OS signal was lost through any
+                    // mechanism (not just the pre-drain race fixed in #25194), this
+                    // ensures the source recovers within one timeout period.
+                    // EvtNext returns ERROR_NO_MORE_ITEMS on an empty channel, which
+                    // is near-zero cost, so it is safe to attempt every cycle.
+                    let (returned_sub, speculative_result) =
+                        with_subscription_blocking(subscription, move |mut sub| {
+                            let result = sub.pull_events(batch_size);
+                            (sub, result)
+                        })
+                        .await?;
+                    subscription = returned_sub;
+
+                    match speculative_result {
+                        Ok(events) if events.is_empty() => {}
+                        Ok(events) => {
+                            warn!(
+                                message = "Speculative timeout pull recovered events; possible lost wakeup detected.",
+                                event_count = events.len(),
+                            );
+                            // Rate limiting between batches (async-compatible).
+                            if let Some(limiter) = subscription.rate_limiter() {
+                                limiter.until_ready().await;
+                            }
+                            if let Some(prepared) =
+                                prepare_event_batch(events, &parser, acknowledgements)
+                            {
+                                let count = prepared.log_events.len();
+                                events_received
+                                    .emit(CountByteSize(count, prepared.byte_size.into()));
+                                bytes_received.emit(ByteSize(prepared.byte_size));
+
+                                if let Err(_error) = out.send_batch(prepared.log_events).await {
+                                    emit!(StreamClosedError { count });
+                                    break;
+                                }
+
+                                let bookmarks: Vec<(String, String)> = prepared
+                                    .channels
+                                    .into_iter()
+                                    .filter_map(|channel| {
+                                        subscription
+                                            .get_bookmark_xml(&channel)
+                                            .map(|xml| (channel, xml))
+                                    })
+                                    .collect();
+                                if !bookmarks.is_empty() {
+                                    finalizer
+                                        .finalize(
+                                            FinalizerEntry { bookmarks },
+                                            prepared.receiver,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            emit!(WindowsEventLogQueryError {
+                                channel: "all".to_string(),
+                                query: None,
+                                error: e.to_string(),
+                            });
+                            if !e.is_recoverable() {
+                                error!(
+                                    message = "Non-recoverable speculative pull error, shutting down.",
+                                    error = %e
+                                );
+                                break;
+                            }
+                            // Exponential backoff mirrors the EventsAvailable error path.
+                            warn!(
+                                message = "Recoverable speculative pull error, backing off.",
+                                backoff_ms = error_backoff.as_millis() as u64,
+                                error = %e
+                            );
+                            tokio::time::sleep(error_backoff).await;
+                            error_backoff = (error_backoff * 2).min(MAX_ERROR_BACKOFF);
                         }
                     }
                 }
