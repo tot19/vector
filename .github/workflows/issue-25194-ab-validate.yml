@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   ab-test:
-    name: ${{ matrix.test_kind }}/${{ matrix.variant }} (expect ${{ matrix.expect }})
+    name: ${{ matrix.test_kind }}/${{ matrix.variant }}${{ matrix.run && format('#{0}', matrix.run) || '' }} (expect ${{ matrix.expect }})
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
@@ -42,9 +42,27 @@ jobs:
           - variant: fixed
             expect: pass
             test_kind: e2e
+            run: 1
+          - variant: fixed
+            expect: pass
+            test_kind: e2e
+            run: 2
+          - variant: fixed
+            expect: pass
+            test_kind: e2e
+            run: 3
           - variant: buggy
             expect: fail
             test_kind: e2e
+            run: 1
+          - variant: buggy
+            expect: fail
+            test_kind: e2e
+            run: 2
+          - variant: buggy
+            expect: fail
+            test_kind: e2e
+            run: 3
     steps:
       - name: Checkout fix branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -306,10 +324,10 @@ jobs:
             if [ "${{ needs.ab-test.result }}" = "success" ]; then
               echo "Result: **PASS**"
               echo ""
-              echo "- **unit/fixed**: deterministic regression test PASSED → fix resolves the lost-wakeup race."
-              echo "- **unit/buggy**: same test FAILED on surgically reverted code → test discriminates, fix is load-bearing."
-              echo "- **e2e/fixed**: real Windows Event Log service, 3.5min inactivity window → event delivered → fix holds end-to-end."
-              echo "- **e2e/buggy**: same real-service test on reverted code → subscription froze (event not delivered) → production race reproduces against real Windows."
+              echo "- **unit/fixed** (1x): deterministic regression test PASSED → fix resolves the lost-wakeup race."
+              echo "- **unit/buggy** (1x): same test FAILED on surgically reverted code → test discriminates, fix is load-bearing."
+              echo "- **e2e/fixed** (3x): real Windows Event Log service, 3.5min inactivity window → event delivered in every run → fix holds end-to-end across independent trials."
+              echo "- **e2e/buggy** (3x): same real-service test on reverted code → subscription froze in every run → production race reproduces reliably against real Windows."
             else
               echo "Result: **FAIL** — see individual cell logs."
             fi
