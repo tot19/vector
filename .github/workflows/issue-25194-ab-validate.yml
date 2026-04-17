@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   ab-test:
-    name: ${{ matrix.variant }} (expect ${{ matrix.expect }})
+    name: ${{ matrix.test_kind }}/${{ matrix.variant }} (expect ${{ matrix.expect }})
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
@@ -35,8 +35,16 @@ jobs:
         include:
           - variant: fixed
             expect: pass
+            test_kind: unit
           - variant: buggy
             expect: fail
+            test_kind: unit
+          - variant: fixed
+            expect: pass
+            test_kind: e2e
+          - variant: buggy
+            expect: fail
+            test_kind: e2e
     steps:
       - name: Checkout fix branch
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -146,8 +154,9 @@ jobs:
         shell: pwsh
         run: .\scripts\environment\bootstrap-windows-2025.ps1
 
-      - name: Run lost-wakeup regression test
-        id: run-test
+      - name: Run lost-wakeup regression test (unit)
+        if: matrix.test_kind == 'unit'
+        id: run-unit-test
         shell: bash
         continue-on-error: true
         run: |
@@ -156,25 +165,132 @@ jobs:
             --lib test_pull_events_preserves_setevent_during_drain \
             -- --nocapture
 
+      - name: Build Vector binary (e2e)
+        if: matrix.test_kind == 'e2e'
+        shell: bash
+        run: |
+          cargo build -p vector --no-default-features \
+            --features sources-windows_event_log,sinks-file
+
+      - name: Run real-service inactivity test (e2e)
+        if: matrix.test_kind == 'e2e'
+        id: run-e2e-test
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Stop"
+          $run = [guid]::NewGuid().ToString("N")
+          $marker1 = "E2E_EVENT_1_$run"
+          $marker2 = "E2E_EVENT_2_$run"
+          $sink = Join-Path $env:RUNNER_TEMP "sink.log"
+          $cfg  = Join-Path $env:RUNNER_TEMP "vector.yaml"
+          $chk  = Join-Path $env:RUNNER_TEMP "checkpoints"
+          New-Item -ItemType Directory -Force -Path $chk | Out-Null
+          Remove-Item -Force $sink -ErrorAction SilentlyContinue
+
+          @"
+          data_dir: "$($chk -replace '\\','/')"
+          sources:
+            weventlog:
+              type: windows_event_log
+              channels: ["Application"]
+              read_existing_events: false
+              batch_size: 16
+          sinks:
+            outfile:
+              type: file
+              inputs: ["weventlog"]
+              path: "$($sink -replace '\\','/')"
+              encoding:
+                codec: json
+          "@ | Set-Content -Path $cfg -Encoding utf8
+
+          Write-Host "--- config ---"; Get-Content $cfg
+
+          $vectorExe = ".\target\debug\vector.exe"
+          $proc = Start-Process -FilePath $vectorExe `
+            -ArgumentList "--config-yaml", $cfg `
+            -PassThru `
+            -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP "vector.out") `
+            -RedirectStandardError  (Join-Path $env:RUNNER_TEMP "vector.err")
+          Write-Host "Started vector pid=$($proc.Id)"
+
+          Start-Sleep -Seconds 15
+          if ($proc.HasExited) {
+            Write-Host "Vector exited early. stderr:"
+            Get-Content (Join-Path $env:RUNNER_TEMP "vector.err")
+            exit 2
+          }
+
+          Write-Host "--- emitting event 1 ($marker1) ---"
+          & eventcreate /T INFORMATION /ID 1000 /L APPLICATION /SO VectorE2E25194 /D $marker1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Host "eventcreate 1 failed"; exit 2 }
+
+          $found1 = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            if ((Test-Path $sink) -and (Select-String -Path $sink -Pattern $marker1 -Quiet -ErrorAction SilentlyContinue)) {
+              $found1 = $true; break
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $found1) {
+            Write-Host "::error::Event 1 never delivered — plumbing broken, cannot test race"
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            exit 2
+          }
+          Write-Host "Event 1 delivered in <=30s — plumbing OK"
+
+          Write-Host "--- sleeping 210s to trigger inactivity window ---"
+          Start-Sleep -Seconds 210
+
+          Write-Host "--- emitting event 2 ($marker2) ---"
+          & eventcreate /T INFORMATION /ID 1001 /L APPLICATION /SO VectorE2E25194 /D $marker2 | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Host "eventcreate 2 failed"; exit 2 }
+
+          $found2 = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            if (Select-String -Path $sink -Pattern $marker2 -Quiet -ErrorAction SilentlyContinue) {
+              $found2 = $true; break
+            }
+            Start-Sleep -Seconds 1
+          }
+
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+
+          Write-Host "--- sink contents ---"
+          if (Test-Path $sink) { Get-Content $sink | Select-Object -Last 20 }
+
+          if ($found2) {
+            Write-Host "Event 2 delivered within 30s of inactivity — subscription did NOT freeze"
+            exit 0
+          } else {
+            Write-Host "Event 2 NOT delivered within 30s — subscription appears frozen (lost-wakeup symptom)"
+            exit 1
+          }
+
       - name: Check fixed-cell expectation
         if: matrix.variant == 'fixed'
         shell: bash
+        env:
+          OUTCOME: ${{ steps.run-unit-test.outcome || steps.run-e2e-test.outcome }}
         run: |
-          if [ "${{ steps.run-test.outcome }}" != "success" ]; then
-            echo "::error::Fixed cell FAILED — the fix does not resolve the race, or the test itself is broken"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "::error::Fixed cell (${{ matrix.test_kind }}) FAILED — the fix does not resolve the race, or the test itself is broken"
             exit 1
           fi
-          echo "Fixed cell: regression test PASSED as expected — fix resolves #25194"
+          echo "Fixed cell (${{ matrix.test_kind }}): regression test PASSED as expected — fix resolves #25194"
 
       - name: Check buggy-cell expectation
         if: matrix.variant == 'buggy'
         shell: bash
+        env:
+          OUTCOME: ${{ steps.run-unit-test.outcome || steps.run-e2e-test.outcome }}
         run: |
-          if [ "${{ steps.run-test.outcome }}" = "success" ]; then
-            echo "::error::Buggy cell PASSED — the regression test is not actually catching the bug (false-pass)"
+          if [ "$OUTCOME" = "success" ]; then
+            echo "::error::Buggy cell (${{ matrix.test_kind }}) PASSED — the regression test is not actually catching the bug (false-pass)"
             exit 1
           fi
-          echo "Buggy cell: regression test FAILED as expected — proves the test catches #25194 and the fix is load-bearing"
+          echo "Buggy cell (${{ matrix.test_kind }}): regression test FAILED as expected — proves the test catches #25194 and the fix is load-bearing"
 
   summary:
     needs: ab-test
@@ -190,8 +306,10 @@ jobs:
             if [ "${{ needs.ab-test.result }}" = "success" ]; then
               echo "Result: **PASS**"
               echo ""
-              echo "- Fixed cell: \`test_pull_events_preserves_setevent_during_drain\` PASSED → the fix resolves the lost-wakeup race."
-              echo "- Buggy cell: same test FAILED on surgically reverted production code → the regression test genuinely catches #25194 and the fix is load-bearing."
+              echo "- **unit/fixed**: deterministic regression test PASSED → fix resolves the lost-wakeup race."
+              echo "- **unit/buggy**: same test FAILED on surgically reverted code → test discriminates, fix is load-bearing."
+              echo "- **e2e/fixed**: real Windows Event Log service, 3.5min inactivity window → event delivered → fix holds end-to-end."
+              echo "- **e2e/buggy**: same real-service test on reverted code → subscription froze (event not delivered) → production race reproduces against real Windows."
             else
               echo "Result: **FAIL** — see individual cell logs."
             fi
