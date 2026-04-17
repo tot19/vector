@@ -1,19 +1,27 @@
 name: Issue 25194 A/B Validation
 
 # Proves the fix for vectordotdev/vector#25194 (windows_event_log lost-wakeup race)
-# by running the deterministic regression test
-# `test_pull_events_preserves_setevent_during_drain` on two cells:
+# by running the deterministic regression tests across three Windows Server
+# versions against two cells:
 #
-#   - fixed: the PR branch as-is                          → test must PASS
-#   - buggy: the PR branch with the fix surgically reverted → test must FAIL
+#   - fixed: current PR head (tot19/fix-windows-event-log-lost-wakeup-25194) → tests must PASS
+#   - buggy: same PR head with the three production fix hunks surgically reverted
+#            (matches the pre-fix upstream code that will ship as v0.55)       → tests must FAIL
 #
-# The embedded base64 patch (REVERT_PATCH_B64) undoes only the three production
-# hunks in `pull_events` (pre-drain ResetEvent, error-path SetEvent re-arm,
-# post-drain ResetEvent → else-branch SetEvent) plus the corresponding
-# SetEvent import change. It keeps the DRAIN_STEP_HOOK static, the test-hook
-# call inside the drain loop, the `first_channel_signal_raw` accessor, and
-# the regression test itself — so the same test runs on both cells and the
-# only variable is the production drain-loop code.
+# The embedded base64 patch (APPLY_PATCH_B64) is a forward "fixed → buggy" diff
+# that undoes only the three production hunks in `pull_events` (pre-drain
+# ResetEvent, error-path SetEvent re-arm, post-drain ResetEvent → else-branch
+# SetEvent) plus the corresponding SetEvent import change. It keeps the
+# DRAIN_STEP_HOOK static, the test-hook call inside the drain loop, the
+# `first_channel_signal_raw` accessor, and the regression tests themselves —
+# so the same tests run on both cells and the only variable is the production
+# drain-loop code.
+#
+# Each (os × variant) cell runs unit-only. The end-to-end cells were removed
+# because the PR's speculative timeout pull (commit 873d0c8f7f) self-heals
+# the race at the mod.rs layer regardless of the subscription.rs bug, making
+# e2e inactivity tests unable to discriminate the two cells. The deterministic
+# unit tests pin the exact invariants under test.
 
 on:
   workflow_dispatch:
@@ -26,141 +34,116 @@ permissions:
 
 jobs:
   ab-test:
-    name: ${{ matrix.test_kind }}/${{ matrix.variant }}${{ matrix.run && format('#{0}', matrix.run) || '' }} (expect ${{ matrix.expect }})
-    runs-on: windows-latest
+    name: ${{ matrix.os }}/${{ matrix.variant }} (expect ${{ matrix.expect }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
+        os: [windows-2025, windows-2022, windows-2019]
         include:
           - variant: fixed
             expect: pass
-            test_kind: unit
           - variant: buggy
             expect: fail
-            test_kind: unit
-          - variant: fixed
-            expect: pass
-            test_kind: e2e
-            run: 1
-          - variant: fixed
-            expect: pass
-            test_kind: e2e
-            run: 2
-          - variant: fixed
-            expect: pass
-            test_kind: e2e
-            run: 3
-          - variant: buggy
-            expect: fail
-            test_kind: e2e
-            run: 1
-          - variant: buggy
-            expect: fail
-            test_kind: e2e
-            run: 2
-          - variant: buggy
-            expect: fail
-            test_kind: e2e
-            run: 3
     steps:
-      - name: Checkout fix branch
+      - name: Checkout PR branch (fixed baseline)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: tot19/windows-event-log-ci-test
+          ref: tot19/fix-windows-event-log-lost-wakeup-25194
           fetch-depth: 1
 
       - name: Apply revert patch (buggy cell only)
         if: matrix.variant == 'buggy'
         shell: bash
         run: |
-          base64 -d > revert_fix.patch <<'B64_EOF'
+          base64 -d > apply_revert.patch <<'B64_EOF'
           ZGlmZiAtLWdpdCBhL3NyYy9zb3VyY2VzL3dpbmRvd3NfZXZlbnRfbG9nL3N1YnNjcmlwdGlvbi5y
-          cyBiL3NyYy9zb3VyY2VzL3dpbmRvd3NfZXZlbnRfbG9nL3N1YnNjcmlwdGlvbi5ycwppbmRleCBk
-          YzkyNzEzZjY5Li44YTgzMzUxZWYxIDEwMDY0NAotLS0gYS9zcmMvc291cmNlcy93aW5kb3dzX2V2
+          cyBiL3NyYy9zb3VyY2VzL3dpbmRvd3NfZXZlbnRfbG9nL3N1YnNjcmlwdGlvbi5ycwppbmRleCBm
+          YjI5ZGRmNDRiLi42MGIwMjkzZjM5IDEwMDY0NAotLS0gYS9zcmMvc291cmNlcy93aW5kb3dzX2V2
           ZW50X2xvZy9zdWJzY3JpcHRpb24ucnMKKysrIGIvc3JjL3NvdXJjZXMvd2luZG93c19ldmVudF9s
           b2cvc3Vic2NyaXB0aW9uLnJzCkBAIC0xOCw5ICsxOCw5IEBAIHVzZSB3aW5kb3dzOjpXaW4zMjo6
           U3lzdGVtOjpFdmVudExvZzo6ewogICAgIEV2dFN1YnNjcmliZVN0YXJ0QWZ0ZXJCb29rbWFyaywg
           RXZ0U3Vic2NyaWJlU3RhcnRBdE9sZGVzdFJlY29yZCwgRXZ0U3Vic2NyaWJlU3RyaWN0LAogICAg
-          IEV2dFN1YnNjcmliZVRvRnV0dXJlRXZlbnRzLAogfTsKLSNbY2ZnKHRlc3QpXQotdXNlIHdpbmRv
-          d3M6OldpbjMyOjpTeXN0ZW06OlRocmVhZGluZzo6U2V0RXZlbnQ7Ci11c2Ugd2luZG93czo6V2lu
-          MzI6OlN5c3RlbTo6VGhyZWFkaW5nOjp7Q3JlYXRlRXZlbnRXLCBSZXNldEV2ZW50LCBXYWl0Rm9y
-          TXVsdGlwbGVPYmplY3RzfTsKK3VzZSB3aW5kb3dzOjpXaW4zMjo6U3lzdGVtOjpUaHJlYWRpbmc6
-          OnsKKyAgICBDcmVhdGVFdmVudFcsIFJlc2V0RXZlbnQsIFNldEV2ZW50LCBXYWl0Rm9yTXVsdGlw
-          bGVPYmplY3RzLAorfTsKIHVzZSB3aW5kb3dzOjpjb3JlOjpIU1RSSU5HOwogCiB1c2Ugc3VwZXI6
-          OnsKQEAgLTQ3OSw5ICs0ODgsMjUgQEAgaW1wbCBFdmVudExvZ1N1YnNjcmlwdGlvbiB7CiAgICAg
+          IEV2dFN1YnNjcmliZVRvRnV0dXJlRXZlbnRzLAogfTsKLXVzZSB3aW5kb3dzOjpXaW4zMjo6U3lz
+          dGVtOjpUaHJlYWRpbmc6OnsKLSAgICBDcmVhdGVFdmVudFcsIFJlc2V0RXZlbnQsIFNldEV2ZW50
+          LCBXYWl0Rm9yTXVsdGlwbGVPYmplY3RzLAotfTsKKyNbY2ZnKHRlc3QpXQordXNlIHdpbmRvd3M6
+          OldpbjMyOjpTeXN0ZW06OlRocmVhZGluZzo6U2V0RXZlbnQ7Cit1c2Ugd2luZG93czo6V2luMzI6
+          OlN5c3RlbTo6VGhyZWFkaW5nOjp7Q3JlYXRlRXZlbnRXLCBSZXNldEV2ZW50LCBXYWl0Rm9yTXVs
+          dGlwbGVPYmplY3RzfTsKIHVzZSB3aW5kb3dzOjpjb3JlOjpIU1RSSU5HOwogCiB1c2Ugc3VwZXI6
+          OnsKQEAgLTQ5MiwyNSArNDkyLDkgQEAgaW1wbCBFdmVudExvZ1N1YnNjcmlwdGlvbiB7CiAgICAg
           ICAgICAgICBsZXQgbXV0IGJvb2ttYXJrX2ZhaWxlZCA9IGZhbHNlOwogICAgICAgICAgICAgbGV0
-          IG11dCBjaGFubmVsX2NvdW50ID0gMHVzaXplOwogCi0gICAgICAgICAgICAvLyBEcmFpbiBsb29w
-          OiBrZWVwIGNhbGxpbmcgRXZ0TmV4dCB1bnRpbCBFUlJPUl9OT19NT1JFX0lURU1TIG9yIGNoYW5u
-          ZWwgYnVkZ2V0LgotICAgICAgICAgICAgLy8gT25seSByZXNldCB0aGUgc2lnbmFsIG9uY2UgdGhl
-          IGNoYW5uZWwgaXMgZnVsbHkgZHJhaW5lZDsgaWYgd2UgaGl0IHRoZQotICAgICAgICAgICAgLy8g
-          YnVkZ2V0IGxpbWl0IHRoZSBzaWduYWwgc3RheXMgc2V0IHNvIFdhaXRGb3JNdWx0aXBsZU9iamVj
-          dHMgcmV0dXJucyBpbW1lZGlhdGVseS4KKyAgICAgICAgICAgIC8vIFJlc2V0IHRoZSBzaWduYWwg
-          QkVGT1JFIGRyYWluaW5nIHRvIGF2b2lkIGEgbG9zdC13YWtldXAgcmFjZQorICAgICAgICAgICAg
-          Ly8gKHNlZSB2ZWN0b3Jkb3RkZXYvdmVjdG9yIzI1MTk0KS4gVGhlIFdpbmRvd3MgRXZlbnQgTG9n
-          IHNlcnZpY2UKKyAgICAgICAgICAgIC8vIHNpZ25hbHMgdGhpcyBtYW51YWwtcmVzZXQgZXZlbnQg
-          dmlhIFNldEV2ZW50IGVhY2ggdGltZSBhIG5ldworICAgICAgICAgICAgLy8gbWF0Y2hpbmcgZXZl
-          bnQgaXMgcmVjb3JkZWQ7IFNldEV2ZW50IG9uIGFuIGFscmVhZHktc2lnbmFsZWQKKyAgICAgICAg
-          ICAgIC8vIGV2ZW50IGlzIGEgbm8tb3AsIHNvIGlmIHdlIHJlc2V0IEFGVEVSIGRyYWluaW5nLCBh
-          bnkgc2lnbmFsCisgICAgICAgICAgICAvLyB0aGF0IGFycml2ZXMgYmV0d2VlbiBvdXIgbGFzdCBF
-          dnROZXh0IGFuZCBSZXNldEV2ZW50IGlzIGxvc3QKKyAgICAgICAgICAgIC8vIOKAlCB0aGUgc3Vi
-          c2NyaXB0aW9uIHRoZW4gaGFuZ3MgdW50aWwgdGhlIG5leHQgZXZlbnQgYXJyaXZlcy4KKyAgICAg
-          ICAgICAgIC8vIFJlc2V0dGluZyBmaXJzdCBtZWFucyBhbnkgc2lnbmFsIHJhaXNlZCBkdXJpbmcg
-          dGhlIGRyYWluIGlzCisgICAgICAgICAgICAvLyBwcmVzZXJ2ZWQsIGNhdXNpbmcgdGhlIG5leHQg
-          V2FpdEZvck11bHRpcGxlT2JqZWN0cyB0byByZXR1cm4KKyAgICAgICAgICAgIC8vIGltbWVkaWF0
-          ZWx5LgorICAgICAgICAgICAgLy8KKyAgICAgICAgICAgIC8vIElmIHdlIGV4aXQgdGhlIGRyYWlu
-          IGxvb3AgZWFybHkgKGNoYW5uZWwgYnVkZ2V0IGV4aGF1c3RlZCBvcgorICAgICAgICAgICAgLy8g
-          Ym9va21hcmsgdXBkYXRlIGZhaWxlZCBtaWQtYmF0Y2gpLCB3ZSByZS1TZXRFdmVudCBhdCB0aGUg
-          ZW5kCisgICAgICAgICAgICAvLyBvZiB0aGlzIGl0ZXJhdGlvbiBzbyB0aGUgbmV4dCBwdWxsX2V2
-          ZW50cyBjYWxsIHJldmlzaXRzIHRoaXMKKyAgICAgICAgICAgIC8vIGNoYW5uZWwgd2l0aG91dCB3
-          YWl0aW5nIGZvciBhIGZyZXNoIE9TIHNpZ25hbC4KKyAgICAgICAgICAgIHVuc2FmZSB7CisgICAg
-          ICAgICAgICAgICAgbGV0IF8gPSBSZXNldEV2ZW50KGNoYW5uZWxfc3ViLnNpZ25hbF9ldmVudCk7
-          CisgICAgICAgICAgICB9CisKICAgICAgICAgICAgICdkcmFpbjogbG9vcCB7CiAgICAgICAgICAg
+          IG11dCBjaGFubmVsX2NvdW50ID0gMHVzaXplOwogCi0gICAgICAgICAgICAvLyBSZXNldCB0aGUg
+          c2lnbmFsIEJFRk9SRSBkcmFpbmluZyB0byBhdm9pZCBhIGxvc3Qtd2FrZXVwIHJhY2UKLSAgICAg
+          ICAgICAgIC8vIChzZWUgdmVjdG9yZG90ZGV2L3ZlY3RvciMyNTE5NCkuIFRoZSBXaW5kb3dzIEV2
+          ZW50IExvZyBzZXJ2aWNlCi0gICAgICAgICAgICAvLyBzaWduYWxzIHRoaXMgbWFudWFsLXJlc2V0
+          IGV2ZW50IHZpYSBTZXRFdmVudCBlYWNoIHRpbWUgYSBuZXcKLSAgICAgICAgICAgIC8vIG1hdGNo
+          aW5nIGV2ZW50IGlzIHJlY29yZGVkOyBTZXRFdmVudCBvbiBhbiBhbHJlYWR5LXNpZ25hbGVkCi0g
+          ICAgICAgICAgICAvLyBldmVudCBpcyBhIG5vLW9wLCBzbyBpZiB3ZSByZXNldCBBRlRFUiBkcmFp
+          bmluZywgYW55IHNpZ25hbAotICAgICAgICAgICAgLy8gdGhhdCBhcnJpdmVzIGJldHdlZW4gb3Vy
+          IGxhc3QgRXZ0TmV4dCBhbmQgUmVzZXRFdmVudCBpcyBsb3N0Ci0gICAgICAgICAgICAvLyDigJQg
+          dGhlIHN1YnNjcmlwdGlvbiB0aGVuIGhhbmdzIHVudGlsIHRoZSBuZXh0IGV2ZW50IGFycml2ZXMu
+          Ci0gICAgICAgICAgICAvLyBSZXNldHRpbmcgZmlyc3QgbWVhbnMgYW55IHNpZ25hbCByYWlzZWQg
+          ZHVyaW5nIHRoZSBkcmFpbiBpcwotICAgICAgICAgICAgLy8gcHJlc2VydmVkLCBjYXVzaW5nIHRo
+          ZSBuZXh0IFdhaXRGb3JNdWx0aXBsZU9iamVjdHMgdG8gcmV0dXJuCi0gICAgICAgICAgICAvLyBp
+          bW1lZGlhdGVseS4KLSAgICAgICAgICAgIC8vCi0gICAgICAgICAgICAvLyBJZiB3ZSBleGl0IHRo
+          ZSBkcmFpbiBsb29wIGVhcmx5IChjaGFubmVsIGJ1ZGdldCBleGhhdXN0ZWQgb3IKLSAgICAgICAg
+          ICAgIC8vIGJvb2ttYXJrIHVwZGF0ZSBmYWlsZWQgbWlkLWJhdGNoKSwgd2UgcmUtU2V0RXZlbnQg
+          YXQgdGhlIGVuZAotICAgICAgICAgICAgLy8gb2YgdGhpcyBpdGVyYXRpb24gc28gdGhlIG5leHQg
+          cHVsbF9ldmVudHMgY2FsbCByZXZpc2l0cyB0aGlzCi0gICAgICAgICAgICAvLyBjaGFubmVsIHdp
+          dGhvdXQgd2FpdGluZyBmb3IgYSBmcmVzaCBPUyBzaWduYWwuCi0gICAgICAgICAgICB1bnNhZmUg
+          ewotICAgICAgICAgICAgICAgIGxldCBfID0gUmVzZXRFdmVudChjaGFubmVsX3N1Yi5zaWduYWxf
+          ZXZlbnQpOwotICAgICAgICAgICAgfQotCisgICAgICAgICAgICAvLyBEcmFpbiBsb29wOiBrZWVw
+          IGNhbGxpbmcgRXZ0TmV4dCB1bnRpbCBFUlJPUl9OT19NT1JFX0lURU1TIG9yIGNoYW5uZWwgYnVk
+          Z2V0LgorICAgICAgICAgICAgLy8gT25seSByZXNldCB0aGUgc2lnbmFsIG9uY2UgdGhlIGNoYW5u
+          ZWwgaXMgZnVsbHkgZHJhaW5lZDsgaWYgd2UgaGl0IHRoZQorICAgICAgICAgICAgLy8gYnVkZ2V0
+          IGxpbWl0IHRoZSBzaWduYWwgc3RheXMgc2V0IHNvIFdhaXRGb3JNdWx0aXBsZU9iamVjdHMgcmV0
+          dXJucyBpbW1lZGlhdGVseS4KICAgICAgICAgICAgICdkcmFpbjogbG9vcCB7CiAgICAgICAgICAg
           ICAgICAgaWYgY2hhbm5lbF9jb3VudCA+PSBjaGFubmVsX2xpbWl0IHsKICAgICAgICAgICAgICAg
-          ICAgICAgYnJlYWs7CkBAIC01NDIsNiArNTc4LDE3IEBAIGltcGwgRXZlbnRMb2dTdWJzY3JpcHRp
+          ICAgICAgYnJlYWs7CkBAIC01ODgsMTcgKzU3Miw2IEBAIGltcGwgRXZlbnRMb2dTdWJzY3JpcHRp
           b24gewogICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICAg
-          ICAgIH0KICAgICAgICAgICAgICAgICAgICAgfQorICAgICAgICAgICAgICAgICAgICAvLyBSZS1h
-          cm0gdGhlIHNpZ25hbCBiZWZvcmUgcmV0dXJuaW5nLiBXZSByZXNldCBpdCBwcmUtZHJhaW4KKyAg
+          ICAgIH0KICAgICAgICAgICAgICAgICAgICAgfQotICAgICAgICAgICAgICAgICAgICAvLyBSZS1h
+          cm0gdGhlIHNpZ25hbCBiZWZvcmUgcmV0dXJuaW5nLiBXZSByZXNldCBpdCBwcmUtZHJhaW4KLSAg
           ICAgICAgICAgICAgICAgICAgLy8gYnV0IGFyZSBiYWlsaW5nIG91dCB3aXRob3V0IGNvbmZpcm1p
-          bmcgdGhlIGRyYWluIGNvbXBsZXRlZCwKKyAgICAgICAgICAgICAgICAgICAgLy8gc28gaWYgZXZl
-          bnRzIHdlcmUgbGVmdCB1bi1kcmFpbmVkIHRoZSBuZXh0IHB1bGxfZXZlbnRzIG11c3QKKyAgICAg
+          bmcgdGhlIGRyYWluIGNvbXBsZXRlZCwKLSAgICAgICAgICAgICAgICAgICAgLy8gc28gaWYgZXZl
+          bnRzIHdlcmUgbGVmdCB1bi1kcmFpbmVkIHRoZSBuZXh0IHB1bGxfZXZlbnRzIG11c3QKLSAgICAg
           ICAgICAgICAgICAgICAgLy8gc3RpbGwgcmV2aXNpdCB0aGlzIGNoYW5uZWwgd2l0aG91dCB3YWl0
-          aW5nIGZvciBhIGZyZXNoIE9TCisgICAgICAgICAgICAgICAgICAgIC8vIHNpZ25hbC4gVGhpcyBt
-          aXJyb3JzIHRoZSBgZWxzZWAgYnJhbmNoIGJlbG93IHRoYXQgaGFuZGxlcworICAgICAgICAgICAg
+          aW5nIGZvciBhIGZyZXNoIE9TCi0gICAgICAgICAgICAgICAgICAgIC8vIHNpZ25hbC4gVGhpcyBt
+          aXJyb3JzIHRoZSBgZWxzZWAgYnJhbmNoIGJlbG93IHRoYXQgaGFuZGxlcwotICAgICAgICAgICAg
           ICAgICAgICAvLyBidWRnZXQtZXhoYXVzdGlvbiBhbmQgYm9va21hcmstZmFpbHVyZSBlYXJseSBi
-          cmVha3MsIGFuZAorICAgICAgICAgICAgICAgICAgICAvLyBhdm9pZHMgdGhlIHNhbWUgbG9zdC13
-          YWtldXAgc3ltcHRvbSAodmVjdG9yZG90ZGV2L3ZlY3RvciMyNTE5NCkKKyAgICAgICAgICAgICAg
-          ICAgICAgLy8gb24gdHJhbnNpZW50IEV2dE5leHQgZmFpbHVyZXMuCisgICAgICAgICAgICAgICAg
-          ICAgIHVuc2FmZSB7CisgICAgICAgICAgICAgICAgICAgICAgICBsZXQgXyA9IFNldEV2ZW50KGNo
-          YW5uZWxfc3ViLnNpZ25hbF9ldmVudCk7CisgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAg
+          cmVha3MsIGFuZAotICAgICAgICAgICAgICAgICAgICAvLyBhdm9pZHMgdGhlIHNhbWUgbG9zdC13
+          YWtldXAgc3ltcHRvbSAodmVjdG9yZG90ZGV2L3ZlY3RvciMyNTE5NCkKLSAgICAgICAgICAgICAg
+          ICAgICAgLy8gb24gdHJhbnNpZW50IEV2dE5leHQgZmFpbHVyZXMuCi0gICAgICAgICAgICAgICAg
+          ICAgIHVuc2FmZSB7Ci0gICAgICAgICAgICAgICAgICAgICAgICBsZXQgXyA9IFNldEV2ZW50KGNo
+          YW5uZWxfc3ViLnNpZ25hbF9ldmVudCk7Ci0gICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAg
           ICAgICAgICAgICAgcmV0dXJuIEVycihXaW5kb3dzRXZlbnRMb2dFcnJvcjo6UHVsbEV2ZW50c0Vy
           cm9yIHsKICAgICAgICAgICAgICAgICAgICAgICAgIGNoYW5uZWw6IGNoYW5uZWxfc3ViLmNoYW5u
-          ZWwuY2xvbmUoKSwKICAgICAgICAgICAgICAgICAgICAgICAgIHNvdXJjZTogZXJyLApAQCAtNjk3
-          LDE1ICs3NDQsMjAgQEAgaW1wbCBFdmVudExvZ1N1YnNjcmlwdGlvbiB7CiAgICAgICAgICAgICB9
+          ZWwuY2xvbmUoKSwKICAgICAgICAgICAgICAgICAgICAgICAgIHNvdXJjZTogZXJyLApAQCAtNzU0
+          LDIwICs3MjcsMTUgQEAgaW1wbCBFdmVudExvZ1N1YnNjcmlwdGlvbiB7CiAgICAgICAgICAgICB9
           CiAKICAgICAgICAgICAgIGlmIGNoYW5uZWxfZHJhaW5lZCAmJiAhYm9va21hcmtfZmFpbGVkIHsK
-          LSAgICAgICAgICAgICAgICB1bnNhZmUgewotICAgICAgICAgICAgICAgICAgICBsZXQgXyA9IFJl
-          c2V0RXZlbnQoY2hhbm5lbF9zdWIuc2lnbmFsX2V2ZW50KTsKLSAgICAgICAgICAgICAgICB9Ci0K
+          KyAgICAgICAgICAgICAgICB1bnNhZmUgeworICAgICAgICAgICAgICAgICAgICBsZXQgXyA9IFJl
+          c2V0RXZlbnQoY2hhbm5lbF9zdWIuc2lnbmFsX2V2ZW50KTsKKyAgICAgICAgICAgICAgICB9CisK
           ICAgICAgICAgICAgICAgICAvLyBVcGRhdGUgY2hhbm5lbCByZWNvcmQgY291bnQgZ2F1Z2UgZm9y
           IGxhZyBkZXRlY3Rpb24uCiAgICAgICAgICAgICAgICAgc3VwZXI6OnJlbmRlcjo6dXBkYXRlX2No
           YW5uZWxfcmVjb3JkcygKICAgICAgICAgICAgICAgICAgICAgJmNoYW5uZWxfc3ViLmNoYW5uZWws
           CiAgICAgICAgICAgICAgICAgICAgICZjaGFubmVsX3N1Yi5jaGFubmVsX3JlY29yZHNfZ2F1Z2Us
-          CiAgICAgICAgICAgICAgICAgKTsKKyAgICAgICAgICAgIH0gZWxzZSB7CisgICAgICAgICAgICAg
+          CiAgICAgICAgICAgICAgICAgKTsKLSAgICAgICAgICAgIH0gZWxzZSB7Ci0gICAgICAgICAgICAg
           ICAgLy8gRHJhaW4gZXhpdGVkIGVhcmx5IChidWRnZXQgZXhoYXVzdGVkIG9yIGJvb2ttYXJrX2Zh
-          aWxlZAorICAgICAgICAgICAgICAgIC8vIG1pZC1iYXRjaCkuIFJlLWFybSB0aGUgc2lnbmFsIHNv
-          IHRoZSBuZXh0IHB1bGxfZXZlbnRzCisgICAgICAgICAgICAgICAgLy8gcmV2aXNpdHMgdGhpcyBj
-          aGFubmVsIGltbWVkaWF0ZWx5IHdpdGhvdXQgd2FpdGluZyBmb3IgYQorICAgICAgICAgICAgICAg
+          aWxlZAotICAgICAgICAgICAgICAgIC8vIG1pZC1iYXRjaCkuIFJlLWFybSB0aGUgc2lnbmFsIHNv
+          IHRoZSBuZXh0IHB1bGxfZXZlbnRzCi0gICAgICAgICAgICAgICAgLy8gcmV2aXNpdHMgdGhpcyBj
+          aGFubmVsIGltbWVkaWF0ZWx5IHdpdGhvdXQgd2FpdGluZyBmb3IgYQotICAgICAgICAgICAgICAg
           IC8vIGZyZXNoIE9TIG5vdGlmaWNhdGlvbi4gUGFpcnMgd2l0aCB0aGUgcHJlLWRyYWluIFJlc2V0
-          RXZlbnQKKyAgICAgICAgICAgICAgICAvLyBhYm92ZS4KKyAgICAgICAgICAgICAgICB1bnNhZmUg
-          eworICAgICAgICAgICAgICAgICAgICBsZXQgXyA9IFNldEV2ZW50KGNoYW5uZWxfc3ViLnNpZ25h
-          bF9ldmVudCk7CisgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgfQogICAgICAgICB9CiAK
+          RXZlbnQKLSAgICAgICAgICAgICAgICAvLyBhYm92ZS4KLSAgICAgICAgICAgICAgICB1bnNhZmUg
+          ewotICAgICAgICAgICAgICAgICAgICBsZXQgXyA9IFNldEV2ZW50KGNoYW5uZWxfc3ViLnNpZ25h
+          bF9ldmVudCk7Ci0gICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgfQogICAgICAgICB9CiAK
           B64_EOF
           echo "--- patch size ---"
-          wc -c revert_fix.patch
+          wc -c apply_revert.patch
           echo "--- first 5 patch lines ---"
-          head -5 revert_fix.patch
-          echo "--- applying reverse patch ---"
-          git apply -R --check revert_fix.patch
-          git apply -R revert_fix.patch
+          head -5 apply_revert.patch
+          echo "--- applying forward patch (fixed -> buggy) ---"
+          git apply --check apply_revert.patch
+          git apply apply_revert.patch
           echo "--- diff stat after revert ---"
           git diff --stat
 
@@ -172,143 +155,41 @@ jobs:
         shell: pwsh
         run: .\scripts\environment\bootstrap-windows-2025.ps1
 
-      - name: Run lost-wakeup regression test (unit)
-        if: matrix.test_kind == 'unit'
-        id: run-unit-test
+      - name: Run lost-wakeup regression tests (unit)
+        id: run-unit-tests
         shell: bash
         continue-on-error: true
         run: |
           cargo test -p vector --no-default-features \
             --features sources-windows_event_log \
-            --lib test_pull_events_preserves_setevent_during_drain \
+            --lib \
+            test_pull_events_preserves_setevent_during_drain \
+            test_speculative_pull_recovers_without_signal \
             -- --nocapture
-
-      - name: Build Vector binary (e2e)
-        if: matrix.test_kind == 'e2e'
-        shell: bash
-        run: |
-          cargo build -p vector --no-default-features \
-            --features sources-windows_event_log,sinks-file
-
-      - name: Run real-service inactivity test (e2e)
-        if: matrix.test_kind == 'e2e'
-        id: run-e2e-test
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          $ErrorActionPreference = "Stop"
-          $run = [guid]::NewGuid().ToString("N")
-          $marker1 = "E2E_EVENT_1_$run"
-          $marker2 = "E2E_EVENT_2_$run"
-          $sink = Join-Path $env:RUNNER_TEMP "sink.log"
-          $cfg  = Join-Path $env:RUNNER_TEMP "vector.yaml"
-          $chk  = Join-Path $env:RUNNER_TEMP "checkpoints"
-          New-Item -ItemType Directory -Force -Path $chk | Out-Null
-          Remove-Item -Force $sink -ErrorAction SilentlyContinue
-
-          @"
-          data_dir: "$($chk -replace '\\','/')"
-          sources:
-            weventlog:
-              type: windows_event_log
-              channels: ["Application"]
-              read_existing_events: false
-              batch_size: 16
-          sinks:
-            outfile:
-              type: file
-              inputs: ["weventlog"]
-              path: "$($sink -replace '\\','/')"
-              encoding:
-                codec: json
-          "@ | Set-Content -Path $cfg -Encoding utf8
-
-          Write-Host "--- config ---"; Get-Content $cfg
-
-          $vectorExe = ".\target\debug\vector.exe"
-          $proc = Start-Process -FilePath $vectorExe `
-            -ArgumentList "--config-yaml", $cfg `
-            -PassThru `
-            -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP "vector.out") `
-            -RedirectStandardError  (Join-Path $env:RUNNER_TEMP "vector.err")
-          Write-Host "Started vector pid=$($proc.Id)"
-
-          Start-Sleep -Seconds 15
-          if ($proc.HasExited) {
-            Write-Host "Vector exited early. stderr:"
-            Get-Content (Join-Path $env:RUNNER_TEMP "vector.err")
-            exit 2
-          }
-
-          Write-Host "--- emitting event 1 ($marker1) ---"
-          & eventcreate /T INFORMATION /ID 100 /L APPLICATION /SO VectorE2E25194 /D $marker1 | Out-Null
-          if ($LASTEXITCODE -ne 0) { Write-Host "eventcreate 1 failed"; exit 2 }
-
-          $found1 = $false
-          for ($i = 0; $i -lt 30; $i++) {
-            if ((Test-Path $sink) -and (Select-String -Path $sink -Pattern $marker1 -Quiet -ErrorAction SilentlyContinue)) {
-              $found1 = $true; break
-            }
-            Start-Sleep -Seconds 1
-          }
-          if (-not $found1) {
-            Write-Host "::error::Event 1 never delivered — plumbing broken, cannot test race"
-            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-            exit 2
-          }
-          Write-Host "Event 1 delivered in <=30s — plumbing OK"
-
-          Write-Host "--- sleeping 210s to trigger inactivity window ---"
-          Start-Sleep -Seconds 210
-
-          Write-Host "--- emitting event 2 ($marker2) ---"
-          & eventcreate /T INFORMATION /ID 200 /L APPLICATION /SO VectorE2E25194 /D $marker2 | Out-Null
-          if ($LASTEXITCODE -ne 0) { Write-Host "eventcreate 2 failed"; exit 2 }
-
-          $found2 = $false
-          for ($i = 0; $i -lt 30; $i++) {
-            if (Select-String -Path $sink -Pattern $marker2 -Quiet -ErrorAction SilentlyContinue) {
-              $found2 = $true; break
-            }
-            Start-Sleep -Seconds 1
-          }
-
-          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-
-          Write-Host "--- sink contents ---"
-          if (Test-Path $sink) { Get-Content $sink | Select-Object -Last 20 }
-
-          if ($found2) {
-            Write-Host "Event 2 delivered within 30s of inactivity — subscription did NOT freeze"
-            exit 0
-          } else {
-            Write-Host "Event 2 NOT delivered within 30s — subscription appears frozen (lost-wakeup symptom)"
-            exit 1
-          }
 
       - name: Check fixed-cell expectation
         if: matrix.variant == 'fixed'
         shell: bash
         env:
-          OUTCOME: ${{ matrix.test_kind == 'unit' && steps.run-unit-test.outcome || steps.run-e2e-test.outcome }}
+          OUTCOME: ${{ steps.run-unit-tests.outcome }}
         run: |
           if [ "$OUTCOME" != "success" ]; then
-            echo "::error::Fixed cell (${{ matrix.test_kind }}) FAILED — the fix does not resolve the race, or the test itself is broken"
+            echo "::error::Fixed cell on ${{ matrix.os }} FAILED — the fix does not resolve the race, or the test itself is broken"
             exit 1
           fi
-          echo "Fixed cell (${{ matrix.test_kind }}): regression test PASSED as expected — fix resolves #25194"
+          echo "Fixed cell on ${{ matrix.os }}: regression tests PASSED as expected — fix resolves #25194"
 
       - name: Check buggy-cell expectation
         if: matrix.variant == 'buggy'
         shell: bash
         env:
-          OUTCOME: ${{ matrix.test_kind == 'unit' && steps.run-unit-test.outcome || steps.run-e2e-test.outcome }}
+          OUTCOME: ${{ steps.run-unit-tests.outcome }}
         run: |
           if [ "$OUTCOME" = "success" ]; then
-            echo "::error::Buggy cell (${{ matrix.test_kind }}) PASSED — the regression test is not actually catching the bug (false-pass)"
+            echo "::error::Buggy cell on ${{ matrix.os }} PASSED — the regression tests are not actually catching the bug (false-pass)"
             exit 1
           fi
-          echo "Buggy cell (${{ matrix.test_kind }}): regression test FAILED as expected — proves the test catches #25194 and the fix is load-bearing"
+          echo "Buggy cell on ${{ matrix.os }}: regression tests FAILED as expected — proves the tests catch #25194 and the fix is load-bearing"
 
   summary:
     needs: ab-test
@@ -324,10 +205,16 @@ jobs:
             if [ "${{ needs.ab-test.result }}" = "success" ]; then
               echo "Result: **PASS**"
               echo ""
-              echo "- **unit/fixed** (1x): deterministic regression test PASSED → fix resolves the lost-wakeup race."
-              echo "- **unit/buggy** (1x): same test FAILED on surgically reverted code → test discriminates, fix is load-bearing."
-              echo "- **e2e/fixed** (3x): real Windows Event Log service, 3.5min inactivity window → event delivered in every run → fix holds end-to-end across independent trials."
-              echo "- **e2e/buggy** (3x): same real-service test on reverted code → subscription froze in every run → production race reproduces reliably against real Windows."
+              echo "Ran deterministic regression tests on three Windows Server versions × two cells:"
+              echo ""
+              echo "- **windows-2025 / fixed**: tests PASSED → fix resolves the lost-wakeup race on Windows Server 2025."
+              echo "- **windows-2025 / buggy**: tests FAILED on reverted code → tests discriminate; fix is load-bearing on 2025."
+              echo "- **windows-2022 / fixed**: tests PASSED → fix holds on Windows Server 2022."
+              echo "- **windows-2022 / buggy**: tests FAILED on reverted code → tests discriminate on 2022."
+              echo "- **windows-2019 / fixed**: tests PASSED → fix holds on Windows Server 2019."
+              echo "- **windows-2019 / buggy**: tests FAILED on reverted code → tests discriminate on 2019."
+              echo ""
+              echo "Baseline for \"buggy\" cells matches upstream pre-fix code that will ship as v0.55."
             else
               echo "Result: **FAIL** — see individual cell logs."
             fi
