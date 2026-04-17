@@ -223,7 +223,7 @@ jobs:
           }
 
           Write-Host "--- emitting event 1 ($marker1) ---"
-          & eventcreate /T INFORMATION /ID 1000 /L APPLICATION /SO VectorE2E25194 /D $marker1 | Out-Null
+          & eventcreate /T INFORMATION /ID 100 /L APPLICATION /SO VectorE2E25194 /D $marker1 | Out-Null
           if ($LASTEXITCODE -ne 0) { Write-Host "eventcreate 1 failed"; exit 2 }
 
           $found1 = $false
@@ -244,7 +244,7 @@ jobs:
           Start-Sleep -Seconds 210
 
           Write-Host "--- emitting event 2 ($marker2) ---"
-          & eventcreate /T INFORMATION /ID 1001 /L APPLICATION /SO VectorE2E25194 /D $marker2 | Out-Null
+          & eventcreate /T INFORMATION /ID 200 /L APPLICATION /SO VectorE2E25194 /D $marker2 | Out-Null
           if ($LASTEXITCODE -ne 0) { Write-Host "eventcreate 2 failed"; exit 2 }
 
           $found2 = $false
