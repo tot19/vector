@@ -1,0 +1,199 @@
+name: Issue 25194 A/B Validation
+
+# Proves the fix for vectordotdev/vector#25194 (windows_event_log lost-wakeup race)
+# by running the deterministic regression test
+# `test_pull_events_preserves_setevent_during_drain` on two cells:
+#
+#   - fixed: the PR branch as-is                          → test must PASS
+#   - buggy: the PR branch with the fix surgically reverted → test must FAIL
+#
+# The embedded base64 patch (REVERT_PATCH_B64) undoes only the three production
+# hunks in `pull_events` (pre-drain ResetEvent, error-path SetEvent re-arm,
+# post-drain ResetEvent → else-branch SetEvent) plus the corresponding
+# SetEvent import change. It keeps the DRAIN_STEP_HOOK static, the test-hook
+# call inside the drain loop, the `first_channel_signal_raw` accessor, and
+# the regression test itself — so the same test runs on both cells and the
+# only variable is the production drain-loop code.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - tot19/issue-25194-ab-validate
+
+permissions:
+  contents: read
+
+jobs:
+  ab-test:
+    name: ${{ matrix.variant }} (expect ${{ matrix.expect }})
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: fixed
+            expect: pass
+          - variant: buggy
+            expect: fail
+    steps:
+      - name: Checkout fix branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: tot19/windows-event-log-ci-test
+          fetch-depth: 1
+
+      - name: Apply revert patch (buggy cell only)
+        if: matrix.variant == 'buggy'
+        shell: bash
+        run: |
+          base64 -d > revert_fix.patch <<'B64_EOF'
+          ZGlmZiAtLWdpdCBhL3NyYy9zb3VyY2VzL3dpbmRvd3NfZXZlbnRfbG9nL3N1YnNjcmlwdGlvbi5y
+          cyBiL3NyYy9zb3VyY2VzL3dpbmRvd3NfZXZlbnRfbG9nL3N1YnNjcmlwdGlvbi5ycwppbmRleCBk
+          YzkyNzEzZjY5Li44YTgzMzUxZWYxIDEwMDY0NAotLS0gYS9zcmMvc291cmNlcy93aW5kb3dzX2V2
+          ZW50X2xvZy9zdWJzY3JpcHRpb24ucnMKKysrIGIvc3JjL3NvdXJjZXMvd2luZG93c19ldmVudF9s
+          b2cvc3Vic2NyaXB0aW9uLnJzCkBAIC0xOCw5ICsxOCw5IEBAIHVzZSB3aW5kb3dzOjpXaW4zMjo6
+          U3lzdGVtOjpFdmVudExvZzo6ewogICAgIEV2dFN1YnNjcmliZVN0YXJ0QWZ0ZXJCb29rbWFyaywg
+          RXZ0U3Vic2NyaWJlU3RhcnRBdE9sZGVzdFJlY29yZCwgRXZ0U3Vic2NyaWJlU3RyaWN0LAogICAg
+          IEV2dFN1YnNjcmliZVRvRnV0dXJlRXZlbnRzLAogfTsKLSNbY2ZnKHRlc3QpXQotdXNlIHdpbmRv
+          d3M6OldpbjMyOjpTeXN0ZW06OlRocmVhZGluZzo6U2V0RXZlbnQ7Ci11c2Ugd2luZG93czo6V2lu
+          MzI6OlN5c3RlbTo6VGhyZWFkaW5nOjp7Q3JlYXRlRXZlbnRXLCBSZXNldEV2ZW50LCBXYWl0Rm9y
+          TXVsdGlwbGVPYmplY3RzfTsKK3VzZSB3aW5kb3dzOjpXaW4zMjo6U3lzdGVtOjpUaHJlYWRpbmc6
+          OnsKKyAgICBDcmVhdGVFdmVudFcsIFJlc2V0RXZlbnQsIFNldEV2ZW50LCBXYWl0Rm9yTXVsdGlw
+          bGVPYmplY3RzLAorfTsKIHVzZSB3aW5kb3dzOjpjb3JlOjpIU1RSSU5HOwogCiB1c2Ugc3VwZXI6
+          OnsKQEAgLTQ3OSw5ICs0ODgsMjUgQEAgaW1wbCBFdmVudExvZ1N1YnNjcmlwdGlvbiB7CiAgICAg
+          ICAgICAgICBsZXQgbXV0IGJvb2ttYXJrX2ZhaWxlZCA9IGZhbHNlOwogICAgICAgICAgICAgbGV0
+          IG11dCBjaGFubmVsX2NvdW50ID0gMHVzaXplOwogCi0gICAgICAgICAgICAvLyBEcmFpbiBsb29w
+          OiBrZWVwIGNhbGxpbmcgRXZ0TmV4dCB1bnRpbCBFUlJPUl9OT19NT1JFX0lURU1TIG9yIGNoYW5u
+          ZWwgYnVkZ2V0LgotICAgICAgICAgICAgLy8gT25seSByZXNldCB0aGUgc2lnbmFsIG9uY2UgdGhl
+          IGNoYW5uZWwgaXMgZnVsbHkgZHJhaW5lZDsgaWYgd2UgaGl0IHRoZQotICAgICAgICAgICAgLy8g
+          YnVkZ2V0IGxpbWl0IHRoZSBzaWduYWwgc3RheXMgc2V0IHNvIFdhaXRGb3JNdWx0aXBsZU9iamVj
+          dHMgcmV0dXJucyBpbW1lZGlhdGVseS4KKyAgICAgICAgICAgIC8vIFJlc2V0IHRoZSBzaWduYWwg
+          QkVGT1JFIGRyYWluaW5nIHRvIGF2b2lkIGEgbG9zdC13YWtldXAgcmFjZQorICAgICAgICAgICAg
+          Ly8gKHNlZSB2ZWN0b3Jkb3RkZXYvdmVjdG9yIzI1MTk0KS4gVGhlIFdpbmRvd3MgRXZlbnQgTG9n
+          IHNlcnZpY2UKKyAgICAgICAgICAgIC8vIHNpZ25hbHMgdGhpcyBtYW51YWwtcmVzZXQgZXZlbnQg
+          dmlhIFNldEV2ZW50IGVhY2ggdGltZSBhIG5ldworICAgICAgICAgICAgLy8gbWF0Y2hpbmcgZXZl
+          bnQgaXMgcmVjb3JkZWQ7IFNldEV2ZW50IG9uIGFuIGFscmVhZHktc2lnbmFsZWQKKyAgICAgICAg
+          ICAgIC8vIGV2ZW50IGlzIGEgbm8tb3AsIHNvIGlmIHdlIHJlc2V0IEFGVEVSIGRyYWluaW5nLCBh
+          bnkgc2lnbmFsCisgICAgICAgICAgICAvLyB0aGF0IGFycml2ZXMgYmV0d2VlbiBvdXIgbGFzdCBF
+          dnROZXh0IGFuZCBSZXNldEV2ZW50IGlzIGxvc3QKKyAgICAgICAgICAgIC8vIOKAlCB0aGUgc3Vi
+          c2NyaXB0aW9uIHRoZW4gaGFuZ3MgdW50aWwgdGhlIG5leHQgZXZlbnQgYXJyaXZlcy4KKyAgICAg
+          ICAgICAgIC8vIFJlc2V0dGluZyBmaXJzdCBtZWFucyBhbnkgc2lnbmFsIHJhaXNlZCBkdXJpbmcg
+          dGhlIGRyYWluIGlzCisgICAgICAgICAgICAvLyBwcmVzZXJ2ZWQsIGNhdXNpbmcgdGhlIG5leHQg
+          V2FpdEZvck11bHRpcGxlT2JqZWN0cyB0byByZXR1cm4KKyAgICAgICAgICAgIC8vIGltbWVkaWF0
+          ZWx5LgorICAgICAgICAgICAgLy8KKyAgICAgICAgICAgIC8vIElmIHdlIGV4aXQgdGhlIGRyYWlu
+          IGxvb3AgZWFybHkgKGNoYW5uZWwgYnVkZ2V0IGV4aGF1c3RlZCBvcgorICAgICAgICAgICAgLy8g
+          Ym9va21hcmsgdXBkYXRlIGZhaWxlZCBtaWQtYmF0Y2gpLCB3ZSByZS1TZXRFdmVudCBhdCB0aGUg
+          ZW5kCisgICAgICAgICAgICAvLyBvZiB0aGlzIGl0ZXJhdGlvbiBzbyB0aGUgbmV4dCBwdWxsX2V2
+          ZW50cyBjYWxsIHJldmlzaXRzIHRoaXMKKyAgICAgICAgICAgIC8vIGNoYW5uZWwgd2l0aG91dCB3
+          YWl0aW5nIGZvciBhIGZyZXNoIE9TIHNpZ25hbC4KKyAgICAgICAgICAgIHVuc2FmZSB7CisgICAg
+          ICAgICAgICAgICAgbGV0IF8gPSBSZXNldEV2ZW50KGNoYW5uZWxfc3ViLnNpZ25hbF9ldmVudCk7
+          CisgICAgICAgICAgICB9CisKICAgICAgICAgICAgICdkcmFpbjogbG9vcCB7CiAgICAgICAgICAg
+          ICAgICAgaWYgY2hhbm5lbF9jb3VudCA+PSBjaGFubmVsX2xpbWl0IHsKICAgICAgICAgICAgICAg
+          ICAgICAgYnJlYWs7CkBAIC01NDIsNiArNTc4LDE3IEBAIGltcGwgRXZlbnRMb2dTdWJzY3JpcHRp
+          b24gewogICAgICAgICAgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAgICAgICAgICAgICAg
+          ICAgIH0KICAgICAgICAgICAgICAgICAgICAgfQorICAgICAgICAgICAgICAgICAgICAvLyBSZS1h
+          cm0gdGhlIHNpZ25hbCBiZWZvcmUgcmV0dXJuaW5nLiBXZSByZXNldCBpdCBwcmUtZHJhaW4KKyAg
+          ICAgICAgICAgICAgICAgICAgLy8gYnV0IGFyZSBiYWlsaW5nIG91dCB3aXRob3V0IGNvbmZpcm1p
+          bmcgdGhlIGRyYWluIGNvbXBsZXRlZCwKKyAgICAgICAgICAgICAgICAgICAgLy8gc28gaWYgZXZl
+          bnRzIHdlcmUgbGVmdCB1bi1kcmFpbmVkIHRoZSBuZXh0IHB1bGxfZXZlbnRzIG11c3QKKyAgICAg
+          ICAgICAgICAgICAgICAgLy8gc3RpbGwgcmV2aXNpdCB0aGlzIGNoYW5uZWwgd2l0aG91dCB3YWl0
+          aW5nIGZvciBhIGZyZXNoIE9TCisgICAgICAgICAgICAgICAgICAgIC8vIHNpZ25hbC4gVGhpcyBt
+          aXJyb3JzIHRoZSBgZWxzZWAgYnJhbmNoIGJlbG93IHRoYXQgaGFuZGxlcworICAgICAgICAgICAg
+          ICAgICAgICAvLyBidWRnZXQtZXhoYXVzdGlvbiBhbmQgYm9va21hcmstZmFpbHVyZSBlYXJseSBi
+          cmVha3MsIGFuZAorICAgICAgICAgICAgICAgICAgICAvLyBhdm9pZHMgdGhlIHNhbWUgbG9zdC13
+          YWtldXAgc3ltcHRvbSAodmVjdG9yZG90ZGV2L3ZlY3RvciMyNTE5NCkKKyAgICAgICAgICAgICAg
+          ICAgICAgLy8gb24gdHJhbnNpZW50IEV2dE5leHQgZmFpbHVyZXMuCisgICAgICAgICAgICAgICAg
+          ICAgIHVuc2FmZSB7CisgICAgICAgICAgICAgICAgICAgICAgICBsZXQgXyA9IFNldEV2ZW50KGNo
+          YW5uZWxfc3ViLnNpZ25hbF9ldmVudCk7CisgICAgICAgICAgICAgICAgICAgIH0KICAgICAgICAg
+          ICAgICAgICAgICAgcmV0dXJuIEVycihXaW5kb3dzRXZlbnRMb2dFcnJvcjo6UHVsbEV2ZW50c0Vy
+          cm9yIHsKICAgICAgICAgICAgICAgICAgICAgICAgIGNoYW5uZWw6IGNoYW5uZWxfc3ViLmNoYW5u
+          ZWwuY2xvbmUoKSwKICAgICAgICAgICAgICAgICAgICAgICAgIHNvdXJjZTogZXJyLApAQCAtNjk3
+          LDE1ICs3NDQsMjAgQEAgaW1wbCBFdmVudExvZ1N1YnNjcmlwdGlvbiB7CiAgICAgICAgICAgICB9
+          CiAKICAgICAgICAgICAgIGlmIGNoYW5uZWxfZHJhaW5lZCAmJiAhYm9va21hcmtfZmFpbGVkIHsK
+          LSAgICAgICAgICAgICAgICB1bnNhZmUgewotICAgICAgICAgICAgICAgICAgICBsZXQgXyA9IFJl
+          c2V0RXZlbnQoY2hhbm5lbF9zdWIuc2lnbmFsX2V2ZW50KTsKLSAgICAgICAgICAgICAgICB9Ci0K
+          ICAgICAgICAgICAgICAgICAvLyBVcGRhdGUgY2hhbm5lbCByZWNvcmQgY291bnQgZ2F1Z2UgZm9y
+          IGxhZyBkZXRlY3Rpb24uCiAgICAgICAgICAgICAgICAgc3VwZXI6OnJlbmRlcjo6dXBkYXRlX2No
+          YW5uZWxfcmVjb3JkcygKICAgICAgICAgICAgICAgICAgICAgJmNoYW5uZWxfc3ViLmNoYW5uZWws
+          CiAgICAgICAgICAgICAgICAgICAgICZjaGFubmVsX3N1Yi5jaGFubmVsX3JlY29yZHNfZ2F1Z2Us
+          CiAgICAgICAgICAgICAgICAgKTsKKyAgICAgICAgICAgIH0gZWxzZSB7CisgICAgICAgICAgICAg
+          ICAgLy8gRHJhaW4gZXhpdGVkIGVhcmx5IChidWRnZXQgZXhoYXVzdGVkIG9yIGJvb2ttYXJrX2Zh
+          aWxlZAorICAgICAgICAgICAgICAgIC8vIG1pZC1iYXRjaCkuIFJlLWFybSB0aGUgc2lnbmFsIHNv
+          IHRoZSBuZXh0IHB1bGxfZXZlbnRzCisgICAgICAgICAgICAgICAgLy8gcmV2aXNpdHMgdGhpcyBj
+          aGFubmVsIGltbWVkaWF0ZWx5IHdpdGhvdXQgd2FpdGluZyBmb3IgYQorICAgICAgICAgICAgICAg
+          IC8vIGZyZXNoIE9TIG5vdGlmaWNhdGlvbi4gUGFpcnMgd2l0aCB0aGUgcHJlLWRyYWluIFJlc2V0
+          RXZlbnQKKyAgICAgICAgICAgICAgICAvLyBhYm92ZS4KKyAgICAgICAgICAgICAgICB1bnNhZmUg
+          eworICAgICAgICAgICAgICAgICAgICBsZXQgXyA9IFNldEV2ZW50KGNoYW5uZWxfc3ViLnNpZ25h
+          bF9ldmVudCk7CisgICAgICAgICAgICAgICAgfQogICAgICAgICAgICAgfQogICAgICAgICB9CiAK
+          B64_EOF
+          echo "--- patch size ---"
+          wc -c revert_fix.patch
+          echo "--- first 5 patch lines ---"
+          head -5 revert_fix.patch
+          echo "--- applying reverse patch ---"
+          git apply -R --check revert_fix.patch
+          git apply -R revert_fix.patch
+          echo "--- diff stat after revert ---"
+          git diff --stat
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.10"
+
+      - name: Bootstrap Windows environment
+        shell: pwsh
+        run: .\scripts\environment\bootstrap-windows-2025.ps1
+
+      - name: Run lost-wakeup regression test
+        id: run-test
+        shell: bash
+        continue-on-error: true
+        run: |
+          cargo test -p vector --no-default-features \
+            --features sources-windows_event_log \
+            --lib test_pull_events_preserves_setevent_during_drain \
+            -- --nocapture
+
+      - name: Check fixed-cell expectation
+        if: matrix.variant == 'fixed'
+        shell: bash
+        run: |
+          if [ "${{ steps.run-test.outcome }}" != "success" ]; then
+            echo "::error::Fixed cell FAILED — the fix does not resolve the race, or the test itself is broken"
+            exit 1
+          fi
+          echo "Fixed cell: regression test PASSED as expected — fix resolves #25194"
+
+      - name: Check buggy-cell expectation
+        if: matrix.variant == 'buggy'
+        shell: bash
+        run: |
+          if [ "${{ steps.run-test.outcome }}" = "success" ]; then
+            echo "::error::Buggy cell PASSED — the regression test is not actually catching the bug (false-pass)"
+            exit 1
+          fi
+          echo "Buggy cell: regression test FAILED as expected — proves the test catches #25194 and the fix is load-bearing"
+
+  summary:
+    needs: ab-test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        shell: bash
+        run: |
+          {
+            echo "## Issue #25194 A/B Validation"
+            echo ""
+            if [ "${{ needs.ab-test.result }}" = "success" ]; then
+              echo "Result: **PASS**"
+              echo ""
+              echo "- Fixed cell: \`test_pull_events_preserves_setevent_during_drain\` PASSED → the fix resolves the lost-wakeup race."
+              echo "- Buggy cell: same test FAILED on surgically reverted production code → the regression test genuinely catches #25194 and the fix is load-bearing."
+            else
+              echo "Result: **FAIL** — see individual cell logs."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "${{ needs.ab-test.result }}" = "success" ]
