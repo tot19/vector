@@ -199,9 +199,9 @@ jobs:
           cargo test -p vector --no-default-features \
             --features sources-windows_event_log \
             --lib \
+            -- --nocapture \
             test_pull_events_preserves_setevent_during_drain \
-            test_speculative_pull_recovers_without_signal \
-            -- --nocapture
+            test_speculative_pull_recovers_without_signal
 
       - name: Build Vector binary (e2e)
         if: matrix.test_kind == 'e2e'
