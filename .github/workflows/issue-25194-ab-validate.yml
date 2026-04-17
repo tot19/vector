@@ -1,27 +1,21 @@
 name: Issue 25194 A/B Validation
 
 # Proves the fix for vectordotdev/vector#25194 (windows_event_log lost-wakeup race)
-# by running the deterministic regression tests across three Windows Server
-# versions against two cells:
+# by running both the deterministic unit regression tests and a 3.5-minute
+# real-service end-to-end inactivity test on Windows Server 2019, 2022, and 2025,
+# each against two cells:
 #
-#   - fixed: current PR head (tot19/fix-windows-event-log-lost-wakeup-25194) → tests must PASS
+#   - fixed: current PR head (tot19/fix-windows-event-log-lost-wakeup-25194) → expect PASS
 #   - buggy: same PR head with the three production fix hunks surgically reverted
-#            (matches the pre-fix upstream code that will ship as v0.55)       → tests must FAIL
+#            (matches the upstream pre-fix code scheduled for v0.55)         → expect FAIL
 #
-# The embedded base64 patch (APPLY_PATCH_B64) is a forward "fixed → buggy" diff
-# that undoes only the three production hunks in `pull_events` (pre-drain
-# ResetEvent, error-path SetEvent re-arm, post-drain ResetEvent → else-branch
-# SetEvent) plus the corresponding SetEvent import change. It keeps the
-# DRAIN_STEP_HOOK static, the test-hook call inside the drain loop, the
-# `first_channel_signal_raw` accessor, and the regression tests themselves —
-# so the same tests run on both cells and the only variable is the production
-# drain-loop code.
-#
-# Each (os × variant) cell runs unit-only. The end-to-end cells were removed
-# because the PR's speculative timeout pull (commit 873d0c8f7f) self-heals
-# the race at the mod.rs layer regardless of the subscription.rs bug, making
-# e2e inactivity tests unable to discriminate the two cells. The deterministic
-# unit tests pin the exact invariants under test.
+# The embedded base64 patch is a forward "fixed -> buggy" diff that undoes only the
+# three production hunks in `pull_events` (pre-drain ResetEvent, error-path SetEvent
+# re-arm, post-drain ResetEvent -> else-branch SetEvent) plus the corresponding
+# SetEvent import change. It keeps the DRAIN_STEP_HOOK static, the test-hook call
+# inside the drain loop, the `first_channel_signal_raw` accessor, and the regression
+# tests themselves -- so the same tests run on both cells and the only variable is
+# the production drain-loop code.
 
 on:
   workflow_dispatch:
@@ -34,18 +28,61 @@ permissions:
 
 jobs:
   ab-test:
-    name: ${{ matrix.os }}/${{ matrix.variant }} (expect ${{ matrix.expect }})
+    name: ${{ matrix.os }}/${{ matrix.variant }}/${{ matrix.test_kind }} (expect ${{ matrix.expect }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2025, windows-2022, windows-2019]
         include:
-          - variant: fixed
+          - os: windows-2025
+            variant: fixed
             expect: pass
-          - variant: buggy
+            test_kind: unit
+          - os: windows-2025
+            variant: fixed
+            expect: pass
+            test_kind: e2e
+          - os: windows-2025
+            variant: buggy
             expect: fail
+            test_kind: unit
+          - os: windows-2025
+            variant: buggy
+            expect: fail
+            test_kind: e2e
+          - os: windows-2022
+            variant: fixed
+            expect: pass
+            test_kind: unit
+          - os: windows-2022
+            variant: fixed
+            expect: pass
+            test_kind: e2e
+          - os: windows-2022
+            variant: buggy
+            expect: fail
+            test_kind: unit
+          - os: windows-2022
+            variant: buggy
+            expect: fail
+            test_kind: e2e
+          - os: windows-2019
+            variant: fixed
+            expect: pass
+            test_kind: unit
+          - os: windows-2019
+            variant: fixed
+            expect: pass
+            test_kind: e2e
+          - os: windows-2019
+            variant: buggy
+            expect: fail
+            test_kind: unit
+          - os: windows-2019
+            variant: buggy
+            expect: fail
+            test_kind: e2e
     steps:
       - name: Checkout PR branch (fixed baseline)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -139,8 +176,6 @@ jobs:
           B64_EOF
           echo "--- patch size ---"
           wc -c apply_revert.patch
-          echo "--- first 5 patch lines ---"
-          head -5 apply_revert.patch
           echo "--- applying forward patch (fixed -> buggy) ---"
           git apply --check apply_revert.patch
           git apply apply_revert.patch
@@ -156,6 +191,7 @@ jobs:
         run: .\scripts\environment\bootstrap-windows-2025.ps1
 
       - name: Run lost-wakeup regression tests (unit)
+        if: matrix.test_kind == 'unit'
         id: run-unit-tests
         shell: bash
         continue-on-error: true
@@ -167,29 +203,132 @@ jobs:
             test_speculative_pull_recovers_without_signal \
             -- --nocapture
 
+      - name: Build Vector binary (e2e)
+        if: matrix.test_kind == 'e2e'
+        shell: bash
+        run: |
+          cargo build -p vector --no-default-features \
+            --features sources-windows_event_log,sinks-file
+
+      - name: Run real-service inactivity test (e2e, 3.5min)
+        if: matrix.test_kind == 'e2e'
+        id: run-e2e-test
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = "Stop"
+          $run = [guid]::NewGuid().ToString("N")
+          $marker1 = "E2E_EVENT_1_$run"
+          $marker2 = "E2E_EVENT_2_$run"
+          $sink = Join-Path $env:RUNNER_TEMP "sink.log"
+          $cfg  = Join-Path $env:RUNNER_TEMP "vector.yaml"
+          $chk  = Join-Path $env:RUNNER_TEMP "checkpoints"
+          New-Item -ItemType Directory -Force -Path $chk | Out-Null
+          Remove-Item -Force $sink -ErrorAction SilentlyContinue
+
+          @"
+          data_dir: "$($chk -replace '\\','/')"
+          sources:
+            weventlog:
+              type: windows_event_log
+              channels: ["Application"]
+              read_existing_events: false
+              batch_size: 16
+          sinks:
+            outfile:
+              type: file
+              inputs: ["weventlog"]
+              path: "$($sink -replace '\\','/')"
+              encoding:
+                codec: json
+          "@ | Set-Content -Path $cfg -Encoding utf8
+
+          Write-Host "--- config ---"; Get-Content $cfg
+
+          $vectorExe = ".\target\debug\vector.exe"
+          $proc = Start-Process -FilePath $vectorExe `
+            -ArgumentList "--config-yaml", $cfg `
+            -PassThru `
+            -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP "vector.out") `
+            -RedirectStandardError  (Join-Path $env:RUNNER_TEMP "vector.err")
+          Write-Host "Started vector pid=$($proc.Id)"
+
+          Start-Sleep -Seconds 15
+          if ($proc.HasExited) {
+            Write-Host "Vector exited early. stderr:"
+            Get-Content (Join-Path $env:RUNNER_TEMP "vector.err")
+            exit 2
+          }
+
+          Write-Host "--- emitting event 1 ($marker1) ---"
+          & eventcreate /T INFORMATION /ID 100 /L APPLICATION /SO VectorE2E25194 /D $marker1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Host "eventcreate 1 failed"; exit 2 }
+
+          $found1 = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            if ((Test-Path $sink) -and (Select-String -Path $sink -Pattern $marker1 -Quiet -ErrorAction SilentlyContinue)) {
+              $found1 = $true; break
+            }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $found1) {
+            Write-Host "::error::Event 1 never delivered -- plumbing broken, cannot test race"
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            exit 2
+          }
+          Write-Host "Event 1 delivered in <=30s -- plumbing OK"
+
+          Write-Host "--- sleeping 210s to trigger 3.5min inactivity window ---"
+          Start-Sleep -Seconds 210
+
+          Write-Host "--- emitting event 2 ($marker2) ---"
+          & eventcreate /T INFORMATION /ID 200 /L APPLICATION /SO VectorE2E25194 /D $marker2 | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Host "eventcreate 2 failed"; exit 2 }
+
+          $found2 = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            if (Select-String -Path $sink -Pattern $marker2 -Quiet -ErrorAction SilentlyContinue) {
+              $found2 = $true; break
+            }
+            Start-Sleep -Seconds 1
+          }
+
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+
+          Write-Host "--- sink contents ---"
+          if (Test-Path $sink) { Get-Content $sink | Select-Object -Last 20 }
+
+          if ($found2) {
+            Write-Host "Event 2 delivered within 30s of inactivity -- subscription did NOT freeze"
+            exit 0
+          } else {
+            Write-Host "Event 2 NOT delivered within 30s -- subscription appears frozen (lost-wakeup symptom)"
+            exit 1
+          }
+
       - name: Check fixed-cell expectation
         if: matrix.variant == 'fixed'
         shell: bash
         env:
-          OUTCOME: ${{ steps.run-unit-tests.outcome }}
+          OUTCOME: ${{ matrix.test_kind == 'unit' && steps.run-unit-tests.outcome || steps.run-e2e-test.outcome }}
         run: |
           if [ "$OUTCOME" != "success" ]; then
-            echo "::error::Fixed cell on ${{ matrix.os }} FAILED — the fix does not resolve the race, or the test itself is broken"
+            echo "::error::Fixed cell ${{ matrix.os }}/${{ matrix.test_kind }} FAILED -- the fix does not resolve the race, or the test itself is broken"
             exit 1
           fi
-          echo "Fixed cell on ${{ matrix.os }}: regression tests PASSED as expected — fix resolves #25194"
+          echo "Fixed cell ${{ matrix.os }}/${{ matrix.test_kind }}: PASSED as expected -- fix resolves #25194"
 
       - name: Check buggy-cell expectation
         if: matrix.variant == 'buggy'
         shell: bash
         env:
-          OUTCOME: ${{ steps.run-unit-tests.outcome }}
+          OUTCOME: ${{ matrix.test_kind == 'unit' && steps.run-unit-tests.outcome || steps.run-e2e-test.outcome }}
         run: |
           if [ "$OUTCOME" = "success" ]; then
-            echo "::error::Buggy cell on ${{ matrix.os }} PASSED — the regression tests are not actually catching the bug (false-pass)"
+            echo "::error::Buggy cell ${{ matrix.os }}/${{ matrix.test_kind }} PASSED -- the test did not catch the bug (false-pass)"
             exit 1
           fi
-          echo "Buggy cell on ${{ matrix.os }}: regression tests FAILED as expected — proves the tests catch #25194 and the fix is load-bearing"
+          echo "Buggy cell ${{ matrix.os }}/${{ matrix.test_kind }}: FAILED as expected -- proves the test catches #25194 and the fix is load-bearing"
 
   summary:
     needs: ab-test
@@ -205,18 +344,11 @@ jobs:
             if [ "${{ needs.ab-test.result }}" = "success" ]; then
               echo "Result: **PASS**"
               echo ""
-              echo "Ran deterministic regression tests on three Windows Server versions × two cells:"
+              echo "Ran unit + 3.5min real-service e2e tests on Windows Server 2019, 2022, and 2025, each on two cells (fixed PR head vs surgically-reverted v0.55-baseline buggy cell)."
               echo ""
-              echo "- **windows-2025 / fixed**: tests PASSED → fix resolves the lost-wakeup race on Windows Server 2025."
-              echo "- **windows-2025 / buggy**: tests FAILED on reverted code → tests discriminate; fix is load-bearing on 2025."
-              echo "- **windows-2022 / fixed**: tests PASSED → fix holds on Windows Server 2022."
-              echo "- **windows-2022 / buggy**: tests FAILED on reverted code → tests discriminate on 2022."
-              echo "- **windows-2019 / fixed**: tests PASSED → fix holds on Windows Server 2019."
-              echo "- **windows-2019 / buggy**: tests FAILED on reverted code → tests discriminate on 2019."
-              echo ""
-              echo "Baseline for \"buggy\" cells matches upstream pre-fix code that will ship as v0.55."
+              echo "All fixed cells passed and all buggy cells failed as expected -- the tests discriminate cleanly and the fix is load-bearing across all three Windows Server versions."
             else
-              echo "Result: **FAIL** — see individual cell logs."
+              echo "Result: **FAIL** -- see individual cell logs."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           [ "${{ needs.ab-test.result }}" = "success" ]
