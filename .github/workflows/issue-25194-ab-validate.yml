@@ -272,7 +272,7 @@ jobs:
         if: matrix.variant == 'fixed'
         shell: bash
         env:
-          OUTCOME: ${{ steps.run-unit-test.outcome || steps.run-e2e-test.outcome }}
+          OUTCOME: ${{ matrix.test_kind == 'unit' && steps.run-unit-test.outcome || steps.run-e2e-test.outcome }}
         run: |
           if [ "$OUTCOME" != "success" ]; then
             echo "::error::Fixed cell (${{ matrix.test_kind }}) FAILED — the fix does not resolve the race, or the test itself is broken"
@@ -284,7 +284,7 @@ jobs:
         if: matrix.variant == 'buggy'
         shell: bash
         env:
-          OUTCOME: ${{ steps.run-unit-test.outcome || steps.run-e2e-test.outcome }}
+          OUTCOME: ${{ matrix.test_kind == 'unit' && steps.run-unit-test.outcome || steps.run-e2e-test.outcome }}
         run: |
           if [ "$OUTCOME" = "success" ]; then
             echo "::error::Buggy cell (${{ matrix.test_kind }}) PASSED — the regression test is not actually catching the bug (false-pass)"
