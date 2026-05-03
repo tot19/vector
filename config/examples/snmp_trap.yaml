@@ -1,10 +1,13 @@
 # SNMP Trap Example
 # ------------------------------------------------------------------------------
-# A simple example that demonstrates receiving SNMP traps over UDP.
-# This source supports SNMPv1 and SNMPv2c traps.
+# Example configuration for receiving SNMP notifications over UDP.
+# This source supports SNMPv1 traps and SNMPv2c traps/informs.
 #
 # To test this configuration, you can use the snmptrap command:
 # snmptrap -v 2c -c public localhost:1162 '' 1.3.6.1.4.1.8072.2.3.0.1 1.3.6.1.4.1.8072.2.3.2.1 i 123456
+#
+# SNMPv2c informs are acknowledged with an RFC 3416 Response-PDU:
+# snmpinform -v 2c -c public localhost:1162 '' 1.3.6.1.4.1.8072.2.3.0.1 1.3.6.1.4.1.8072.2.3.2.1 i 123456
 
 data_dir: "/var/lib/vector"
 
@@ -14,6 +17,9 @@ sources:
   snmp_traps:
     type: snmp_trap
     address: "0.0.0.0:1162"
+    # Optional: load MIB files or directories recursively to resolve OID names.
+    # mib_paths:
+    #   - "/etc/snmp/mibs"
     # Optional: Set receive buffer size
     receive_buffer_bytes: 65536
 
@@ -23,24 +29,33 @@ transforms:
     type: remap
     inputs: ["snmp_traps"]
     source: |
-      # Add a timestamp if not present
-      if !exists(.timestamp) {
-        .timestamp = now()
-      }
-
-      # Add a human-readable severity based on trap type
+      # Illustrative severity mapping; adapt to your alerting policy.
       if .snmp_version == "1" {
         .severity = if .generic_trap == 0 {
           "info"
-        } else if .generic_trap == 2 || .generic_trap == 3 {
+        } else if .generic_trap == 2 {
           "warning"
         } else if .generic_trap == 4 {
           "critical"
+        } else if .generic_trap == 5 {
+          "warning"
         } else {
           "info"
         }
       } else {
         .severity = "info"
+      }
+
+      # Example: branch on SNMPv2c notification delivery semantics
+      if .pdu_type == "inform_request" {
+        .delivery = "confirmed"
+      } else {
+        .delivery = "unconfirmed"
+      }
+
+      # Use resolved trap names when MIBs define them, but keep numeric OIDs available.
+      if exists(.trap_oid) {
+        .trap_name = .trap_oid_name ?? .trap_oid
       }
 
 # Output to console for inspection
