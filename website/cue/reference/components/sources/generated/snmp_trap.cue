@@ -14,7 +14,7 @@ generated: components: sources: snmp_trap: configuration: {
 		description: """
 			Overrides the name of the log field used to add the peer host to each event.
 
-			The value is the peer host's address, including the port. For example, `192.168.1.1:162`.
+			The value is the peer host's IP address. For example, `192.168.1.1`.
 
 			By default, the [global `log_schema.host_key` option][global_host_key] is used.
 
@@ -22,6 +22,21 @@ generated: components: sources: snmp_trap: configuration: {
 			"""
 		required: false
 		type: string: {}
+	}
+	mib_paths: {
+		description: """
+			MIB files or directories to load for OID name resolution.
+
+			Directories are scanned recursively with bounded depth and file count, without following
+			symlinked directories. Directory scans load files with common MIB extensions or no
+			extension, and each MIB file must be at most 8 MiB. Numeric OIDs are always preserved, and
+			resolved names are added in separate metadata fields.
+			"""
+		required: false
+		type: array: {
+			default: []
+			items: type: string: {}
+		}
 	}
 	receive_buffer_bytes: {
 		description: """
