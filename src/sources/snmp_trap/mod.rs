@@ -866,6 +866,130 @@ mod tests {
         shutdown_complete.await;
     }
 
+    #[tokio::test]
+    async fn test_udp_source_drops_garbage_bytes_without_crashing() {
+        let (_guard, addr) = next_addr();
+        let config = SnmpTrapConfig {
+            address: SocketListenAddr::SocketAddr(addr),
+            receive_buffer_bytes: None,
+            host_key: None,
+            mib_paths: Vec::new(),
+            log_namespace: None,
+        };
+
+        let key = ComponentKey::from("snmp_trap");
+        let (tx, mut rx) = SourceSender::new_test();
+        let (context, shutdown) = SourceContext::new_shutdown(&key, tx);
+        let shutdown_complete = shutdown.shutdown_tripwire();
+
+        let source = config.build(context).await.unwrap();
+        tokio::spawn(source);
+        sleep(Duration::from_millis(150)).await;
+
+        // Send raw garbage that is not valid BER/SNMP
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket
+            .send_to(&[0xff; 64], addr)
+            .await
+            .unwrap();
+
+        // No event should arrive — the garbage must be silently dropped
+        assert!(
+            timeout(Duration::from_millis(300), rx.next())
+                .await
+                .is_err(),
+            "garbage bytes should not produce an event"
+        );
+
+        // Verify the source is still alive by sending a valid trap after
+        socket
+            .send_to(&v2c_notification(PduType::TrapV2), addr)
+            .await
+            .unwrap();
+
+        let event = timeout(Duration::from_secs(2), rx.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.as_log()["snmp_version"], "2c".into());
+
+        shutdown
+            .shutdown_all(Some(Instant::now() + Duration::from_millis(100)))
+            .await;
+        shutdown_complete.await;
+    }
+
+    #[tokio::test]
+    async fn test_udp_source_drops_snmpv3_packet_cleanly() {
+        let (_guard, addr) = next_addr();
+        let config = SnmpTrapConfig {
+            address: SocketListenAddr::SocketAddr(addr),
+            receive_buffer_bytes: None,
+            host_key: None,
+            mib_paths: Vec::new(),
+            log_namespace: None,
+        };
+
+        let key = ComponentKey::from("snmp_trap");
+        let (tx, mut rx) = SourceSender::new_test();
+        let (context, shutdown) = SourceContext::new_shutdown(&key, tx);
+        let shutdown_complete = shutdown.shutdown_tripwire();
+
+        let source = config.build(context).await.unwrap();
+        tokio::spawn(source);
+        sleep(Duration::from_millis(150)).await;
+
+        // Minimal SNMPv3 message: SEQUENCE { INTEGER 3, ... }
+        // version=3 is enough to trigger the v3 rejection path
+        let snmpv3_packet = encode_sequence(&{
+            let mut msg = Vec::new();
+            msg.extend(encode_integer(3)); // version = SNMPv3
+            // msgGlobalData: SEQUENCE { msgID, maxSize, flags, securityModel }
+            let mut global = Vec::new();
+            global.extend(encode_integer(1));      // msgID
+            global.extend(encode_integer(65507));   // msgMaxSize
+            global.extend(encode_tlv(0x04, &[0x04])); // msgFlags (reportable)
+            global.extend(encode_integer(3));       // USM security model
+            msg.extend(encode_sequence(&global));
+            // msgSecurityParameters: OCTET STRING (empty)
+            msg.extend(encode_tlv(0x04, &[]));
+            // msgData: SEQUENCE (empty plaintext placeholder)
+            msg.extend(encode_sequence(&[]));
+            msg
+        });
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket
+            .send_to(&snmpv3_packet, addr)
+            .await
+            .unwrap();
+
+        // Should not produce an event (v3 is rejected)
+        assert!(
+            timeout(Duration::from_millis(300), rx.next())
+                .await
+                .is_err(),
+            "SNMPv3 packet should not produce an event"
+        );
+
+        // Source must still be healthy
+        socket
+            .send_to(&v2c_notification(PduType::TrapV2), addr)
+            .await
+            .unwrap();
+
+        let event = timeout(Duration::from_secs(2), rx.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.as_log()["snmp_version"], "2c".into());
+
+        shutdown
+            .shutdown_all(Some(Instant::now() + Duration::from_millis(100)))
+            .await;
+        shutdown_complete.await;
+    }
+
     fn v2c_notification(pdu_type: PduType) -> Vec<u8> {
         v2c_message(
             pdu_type,
