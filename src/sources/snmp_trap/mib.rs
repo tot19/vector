@@ -58,7 +58,16 @@ impl MibResolver {
         for path in paths {
             for file in mib_files(path)? {
                 match read_mib_file(&file.path) {
-                    Ok(contents) => definitions.extend(parse_definitions(&contents)),
+                    Ok(contents) => {
+                        let parsed = parse_definitions(&contents);
+                        if parsed.is_empty() {
+                            warn!(
+                                message = "MIB file produced no definitions; OID names from this file will not resolve. Verify the file is a valid SMIv1/v2 module.",
+                                path = %file.path.display(),
+                            );
+                        }
+                        definitions.extend(parsed);
+                    }
                     Err(error) if file.required => return Err(error),
                     Err(error) => {
                         warn!(
@@ -71,7 +80,28 @@ impl MibResolver {
             }
         }
 
-        resolver.resolve_definitions(definitions);
+        let unresolved = resolver.resolve_definitions(definitions);
+        for (symbol, definitions) in unresolved {
+            let total = definitions.len();
+            let mut sample: Vec<String> = definitions
+                .into_iter()
+                .take(5)
+                .map(|definition| match definition.module {
+                    Some(module) => format!("{module}::{}", definition.name),
+                    None => definition.name,
+                })
+                .collect();
+            if total > sample.len() {
+                sample.push(format!("... and {} more", total - sample.len()));
+            }
+            warn!(
+                message = "MIB definitions reference an unresolved symbol; affected names will not resolve. Load the MIB module that defines this symbol.",
+                symbol = %symbol,
+                affected_definitions = total,
+                sample = ?sample,
+            );
+        }
+
         Ok(resolver)
     }
 
@@ -170,7 +200,10 @@ impl MibResolver {
         );
     }
 
-    fn resolve_definitions(&mut self, definitions: Vec<RawDefinition>) {
+    fn resolve_definitions(
+        &mut self,
+        definitions: Vec<RawDefinition>,
+    ) -> HashMap<String, Vec<RawDefinition>> {
         let mut symbols = self.symbols_by_name();
         let mut waiting_by_symbol: HashMap<String, Vec<RawDefinition>> = HashMap::new();
         let mut ready_symbols = VecDeque::new();
@@ -198,6 +231,8 @@ impl MibResolver {
                 );
             }
         }
+
+        waiting_by_symbol
     }
 
     fn resolve_or_queue_definition(
@@ -244,7 +279,7 @@ impl MibResolver {
     #[cfg(test)]
     pub(super) fn from_str(contents: &str) -> Self {
         let mut resolver = Self::with_builtin_symbols();
-        resolver.resolve_definitions(parse_definitions(contents));
+        let _ = resolver.resolve_definitions(parse_definitions(contents));
         resolver
     }
 }
@@ -917,6 +952,80 @@ END
                 symbol: "testObject".to_string(),
                 instance: Some("0".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn parse_returns_empty_for_non_mib_content() {
+        let parsed = parse_definitions("this is just a README file, not a MIB module at all.\n");
+        assert!(
+            parsed.is_empty(),
+            "expected no definitions from non-MIB text, got {} definition(s)",
+            parsed.len()
+        );
+    }
+
+    #[test]
+    fn resolve_definitions_returns_unresolved_imports() {
+        let mut resolver = MibResolver::with_builtin_symbols();
+        let definitions = parse_definitions(
+            r#"
+NEEDS-IMPORT-MIB DEFINITIONS ::= BEGIN
+
+dependentObject OBJECT IDENTIFIER ::= { unknownSymbol 1 }
+
+END
+"#,
+        );
+
+        let unresolved = resolver.resolve_definitions(definitions);
+
+        let stuck = unresolved
+            .get("unknownSymbol")
+            .expect("unknownSymbol should appear in the unresolved map");
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(stuck[0].name, "dependentObject");
+    }
+
+    #[test]
+    fn from_paths_keeps_loading_when_a_file_is_not_a_mib() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("VALID-MIB.txt"), TEST_MIB).unwrap();
+        fs::write(
+            temp_dir.path().join("NOT-A-MIB.txt"),
+            "just some plain text, no MIB module here\n",
+        )
+        .unwrap();
+
+        let resolver = MibResolver::from_paths(&[temp_dir.path().to_path_buf()]).unwrap();
+
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.8072.2.3.0.1").unwrap().name,
+            "TEST-MIB::testTrap"
+        );
+    }
+
+    #[test]
+    fn from_paths_keeps_loading_when_a_definition_has_an_unknown_import() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        fs::write(temp_dir.path().join("VALID-MIB.txt"), TEST_MIB).unwrap();
+        fs::write(
+            temp_dir.path().join("DEPENDS-ON-MISSING.txt"),
+            r#"
+DEPENDS-ON-MISSING DEFINITIONS ::= BEGIN
+
+needsMissing OBJECT IDENTIFIER ::= { unloadedRoot 99 }
+
+END
+"#,
+        )
+        .unwrap();
+
+        let resolver = MibResolver::from_paths(&[temp_dir.path().to_path_buf()]).unwrap();
+
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.8072.2.3.0.1").unwrap().name,
+            "TEST-MIB::testTrap"
         );
     }
 }
