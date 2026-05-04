@@ -982,6 +982,7 @@ all-integration-tests = [
   "prometheus-integration-tests",
   "pulsar-integration-tests",
   "redis-integration-tests",
+  "snmp-trap-integration-tests",
   "splunk-integration-tests",
   "vector-api-tests",
   "webhdfs-integration-tests",
@@ -1052,6 +1053,7 @@ postgres_sink-integration-tests = ["sinks-postgres"]
 prometheus-integration-tests = ["sinks-prometheus", "sources-prometheus", "sinks-influxdb"]
 pulsar-integration-tests = ["sinks-pulsar", "sources-pulsar"]
 redis-integration-tests = ["sinks-redis", "sources-redis"]
+snmp-trap-integration-tests = ["sources-snmp_trap"]
 splunk-integration-tests = ["sinks-splunk_hec"]
 dnstap-integration-tests = ["sources-dnstap", "dep:bollard"]
 webhdfs-integration-tests = ["sinks-webhdfs"]

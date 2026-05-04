@@ -1000,3 +1000,6 @@ END
         value
     }
 }
+
+#[cfg(all(test, feature = "snmp-trap-integration-tests"))]
+mod integration_tests;

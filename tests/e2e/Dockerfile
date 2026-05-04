@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zlib1g \
     unzip \
     mold \
+    snmp \
   && rm -rf /var/lib/apt/lists/*
 
 COPY tests/data/ca/certs /certs

@@ -112,6 +112,7 @@ jobs:
             "prometheus",
             "pulsar",
             "redis",
+            "snmp-trap",
             "webhdfs"
           ]
     timeout-minutes: 90
