@@ -465,6 +465,7 @@ urls: {
 	rfc_3339:                                   "https://tools.ietf.org/html/rfc3339"
 	rfc_3414:                                   "https://www.rfc-editor.org/rfc/rfc3414.html"
 	rfc_3416:                                   "https://www.rfc-editor.org/rfc/rfc3416.html"
+	rfc_3584:                                   "https://www.rfc-editor.org/rfc/rfc3584.html"
 	rfc_3826:                                   "https://www.rfc-editor.org/rfc/rfc3826.html"
 	rfc_4180:                                   "https://tools.ietf.org/html/rfc4180"
 	rfc_6587_3_4_1:                             "https://tools.ietf.org/html/rfc6587#section-3.4.1"

@@ -6,8 +6,7 @@ components: sources: snmp_trap: {
 	title: "SNMP Trap"
 
 	classes: {
-		commonly_used: false
-		delivery:      "best_effort"
+		delivery: "best_effort"
 		deployment_roles: ["aggregator"]
 		development:   "beta"
 		egress_method: "stream"
@@ -49,11 +48,6 @@ components: sources: snmp_trap: {
 				This source acknowledges SNMPv2c InformRequest-PDUs from any source IP after Vector accepts the event for forwarding. Because InformRequest responses echo request varbinds, an internet-exposed listener can act as a UDP reflection target. Place the source behind network ACLs or firewall rules appropriate for plaintext SNMPv1 and SNMPv2c traffic.
 				""",
 		]
-		notices: [
-			"""
-				This source preserves numeric OIDs as received. When `mib_paths` is configured, Vector also resolves [RFC 2578](\(urls.rfc_2578)) SMIv2 object names into separate metadata fields.
-				""",
-		]
 	}
 
 	installation: {
@@ -83,7 +77,7 @@ components: sources: snmp_trap: {
 				description: "The IP address and port of the SNMP agent that sent the notification."
 				required:    true
 				type: string: {
-					examples: ["192.168.1.100:161"]
+					examples: ["192.168.1.100:49152"]
 				}
 			}
 			community: {
@@ -97,28 +91,28 @@ components: sources: snmp_trap: {
 				description: "The enterprise OID identifying the device type (SNMPv1 only)."
 				required:    false
 				type: string: {
-					examples: ["1.3.6.1.4.1.8072.2.3.0.1"]
+					examples: ["1.3.6.1.4.1.8072.3.2.10"]
 				}
 			}
 			enterprise_oid_name: {
 				description: "The resolved enterprise OID name when a configured MIB defines it (SNMPv1 only)."
 				required:    false
 				type: string: {
-					examples: ["TEST-MIB::testTrap"]
+					examples: ["NET-SNMP-TC::linux"]
 				}
 			}
 			enterprise_oid_module: {
 				description: "The MIB module that defined the resolved enterprise OID name (SNMPv1 only)."
 				required:    false
 				type: string: {
-					examples: ["TEST-MIB"]
+					examples: ["NET-SNMP-TC"]
 				}
 			}
 			enterprise_oid_symbol: {
 				description: "The symbol within the defining MIB module for the enterprise OID (SNMPv1 only)."
 				required:    false
 				type: string: {
-					examples: ["testTrap"]
+					examples: ["linux"]
 				}
 			}
 			enterprise_oid_instance: {
@@ -159,35 +153,35 @@ components: sources: snmp_trap: {
 				}
 			}
 			trap_oid: {
-				description: "The snmpTrapOID.0 value identifying the notification type (SNMPv2c traps and informs only)."
-				required:    false
+				description: "The snmpTrapOID.0 value identifying the notification type. For SNMPv1 traps, this is derived from the generic and specific trap fields as described in [RFC 3584](\(urls.rfc_3584))."
+				required:    true
 				type: string: {
 					examples: ["1.3.6.1.6.3.1.1.5.1"]
 				}
 			}
 			trap_oid_name: {
-				description: "The resolved trap OID name when a built-in or configured MIB defines it (SNMPv2c traps and informs only)."
+				description: "The resolved trap OID name when a built-in or configured MIB defines it."
 				required:    false
 				type: string: {
 					examples: ["SNMPv2-MIB::coldStart", "TEST-MIB::testTrap"]
 				}
 			}
 			trap_oid_module: {
-				description: "The MIB module that defined the resolved trap OID name (SNMPv2c traps and informs only)."
+				description: "The MIB module that defined the resolved trap OID name."
 				required:    false
 				type: string: {
 					examples: ["SNMPv2-MIB", "TEST-MIB"]
 				}
 			}
 			trap_oid_symbol: {
-				description: "The symbol within the defining MIB module for the trap OID (SNMPv2c traps and informs only)."
+				description: "The symbol within the defining MIB module for the trap OID."
 				required:    false
 				type: string: {
 					examples: ["coldStart", "testTrap"]
 				}
 			}
 			trap_oid_instance: {
-				description: "The instance suffix after the resolved trap OID symbol, if any (SNMPv2c traps and informs only)."
+				description: "The instance suffix after the resolved trap OID symbol, if any."
 				required:    false
 				type: string: {
 					examples: ["0"]
@@ -196,7 +190,7 @@ components: sources: snmp_trap: {
 			request_id: {
 				description: "The request ID from the notification message (SNMPv2c only)."
 				required:    false
-				type: uint: {
+				type: int: {
 					examples: [12345]
 					unit: null
 				}
@@ -295,11 +289,25 @@ components: sources: snmp_trap: {
 					}
 				}
 			}
+			host: {
+				description: "The IP address of the peer that sent the notification. The field name can be changed with the `host_key` option."
+				required:    true
+				type: string: {
+					examples: ["192.168.1.100"]
+				}
+			}
+			source_type: {
+				description: "The name of the source type."
+				required:    true
+				type: string: {
+					examples: ["snmp_trap"]
+				}
+			}
 			message: {
 				description: "A human-readable summary of the notification."
 				required:    true
 				type: string: {
-					examples: ["SNMPv1 trap from 192.168.1.100:161 (1.3.6.1.4.1.8072.2.3.0.1): coldStart"]
+					examples: ["SNMPv1 trap from 192.168.1.100:49152 (1.3.6.1.4.1.8072.3.2.10): coldStart"]
 				}
 			}
 			timestamp: {
@@ -321,7 +329,7 @@ components: sources: snmp_trap: {
 			output: log: {
 				snmp_version:    "2c"
 				pdu_type:        "trap_v2"
-				source_address:  "192.168.1.100:161"
+				source_address:  "192.168.1.100:49152"
 				community:       "public"
 				request_id:      12345
 				trap_oid:        "1.3.6.1.4.1.8072.2.3.0.1"
@@ -333,8 +341,10 @@ components: sources: snmp_trap: {
 					{oid: "1.3.6.1.2.1.1.3.0", oid_name: "SNMPv2-MIB::sysUpTime.0", oid_module: "SNMPv2-MIB", oid_symbol: "sysUpTime", oid_instance: "0", type: "timeticks", value: "123456"},
 					{oid: "1.3.6.1.6.3.1.1.4.1.0", oid_name: "SNMPv2-MIB::snmpTrapOID.0", oid_module: "SNMPv2-MIB", oid_symbol: "snmpTrapOID", oid_instance: "0", type: "object_identifier", value: "1.3.6.1.4.1.8072.2.3.0.1", value_oid_name: "TEST-MIB::testTrap", value_oid_module: "TEST-MIB", value_oid_symbol: "testTrap"},
 				]
-				message:   "SNMPv2c trap from 192.168.1.100:161: 1.3.6.1.4.1.8072.2.3.0.1"
-				timestamp: "2024-01-15T10:30:00Z"
+				message:     "SNMPv2c trap from 192.168.1.100:49152: 1.3.6.1.4.1.8072.2.3.0.1"
+				host:        "192.168.1.100"
+				source_type: "snmp_trap"
+				timestamp:   "2024-01-15T10:30:00Z"
 			}
 		},
 	]
@@ -348,8 +358,9 @@ components: sources: snmp_trap: {
 				[RFC 3416](\(urls.rfc_3416)).
 
 				SNMPv1 traps contain enterprise OID, agent address, generic trap type, and
-				specific trap code fields. SNMPv2c traps use a different format with trap OID
-				and request ID fields.
+				specific trap code fields. SNMPv2c notifications carry a trap OID and request ID
+				instead. So that both versions can be handled the same way, SNMPv1 traps also
+				get a `trap_oid` field derived as described in [RFC 3584](\(urls.rfc_3584)).
 
 				SNMPv3 traps are not supported because validating [RFC 3414](\(urls.rfc_3414))
 				User-based Security Model authentication and timeliness, and privacy transforms
@@ -409,13 +420,13 @@ components: sources: snmp_trap: {
 				scans include files with `.mib`, `.my`, `.smi`, `.txt`, or no extension. Vector
 				resolves [RFC 2578](\(urls.rfc_2578)) SMIv2 object identifier assignments such as
 				`OBJECT IDENTIFIER`, `OBJECT-TYPE`, `OBJECT-IDENTITY`, `MODULE-IDENTITY`, and
-				`NOTIFICATION-TYPE`.
+				`NOTIFICATION-TYPE`, as well as SMIv1 `TRAP-TYPE` definitions.
 
 				Resolved names are emitted in fields such as `trap_oid_name`, `enterprise_oid_name`,
 				`varbinds[].oid_name`, and `varbinds[].value_oid_name`. Numeric OIDs remain in
-				`trap_oid`, `enterprise_oid`, `varbinds[].oid`, and `varbinds[].value`. MIB
-				resolution is best-effort and does not evaluate every ASN.1/SMI construct or
-				enforce every `IMPORTS` relationship.
+				`trap_oid`, `enterprise_oid`, `varbinds[].oid`, and `varbinds[].value`. Names are
+				resolved within each module's own definitions and `IMPORTS` first. MIB resolution
+				is best-effort and does not evaluate every ASN.1/SMI construct.
 				"""
 		}
 
