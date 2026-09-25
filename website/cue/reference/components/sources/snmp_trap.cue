@@ -44,6 +44,9 @@ components: sources: snmp_trap: {
 			"""
 				This source supports SNMPv1 and SNMPv2c notifications only. SNMPv3 messages are rejected because [RFC 3414](\(urls.rfc_3414)) USM authentication and timeliness checks, and [RFC 3826](\(urls.rfc_3826)) AES privacy handling, are not implemented.
 				""",
+			"""
+				This source acknowledges SNMPv2c InformRequest-PDUs from any sender after Vector accepts the event for forwarding. Because InformRequest responses echo request varbinds to the claimed source address, an internet-exposed listener can act as a UDP reflection target. Place the source behind network ACLs or firewall rules appropriate for plaintext SNMPv1 and SNMPv2c traffic.
+				""",
 		]
 	}
 
@@ -54,7 +57,7 @@ components: sources: snmp_trap: {
 	configuration: generated.components.sources.snmp_trap.configuration
 
 	output: logs: trap: {
-		description: "An individual SNMP trap event"
+		description: "An individual SNMP trap or inform event"
 		fields: {
 			snmp_version: {
 				description: "The SNMP version of the notification message."
@@ -67,7 +70,7 @@ components: sources: snmp_trap: {
 				description: "The SNMP notification PDU type."
 				required:    true
 				type: string: {
-					examples: ["trap_v1", "trap_v2"]
+					examples: ["trap_v1", "trap_v2", "inform_request"]
 				}
 			}
 			source_address: {
@@ -235,7 +238,7 @@ components: sources: snmp_trap: {
 			title: "Supported SNMP Versions"
 			body:  """
 				This source supports SNMPv1 Trap-PDUs as defined by [RFC 1157](\(urls.rfc_1157))
-				and SNMPv2c SNMPv2-Trap-PDUs as defined by
+				and SNMPv2c SNMPv2-Trap-PDUs and InformRequest-PDUs as defined by
 				[RFC 3416](\(urls.rfc_3416)).
 
 				SNMPv1 traps contain enterprise OID, agent address, generic trap type, and
@@ -250,6 +253,20 @@ components: sources: snmp_trap: {
 				"""
 		}
 
+		inform_requests: {
+			title: "InformRequest Acknowledgements"
+			body:  """
+				SNMPv2c InformRequest-PDUs are confirmed notifications. After parsing an inform
+				and accepting the event for forwarding, Vector sends an [RFC 3416](\(urls.rfc_3416))
+				Response-PDU to the sender with the same request ID and variable bindings,
+				`noError` as the error status, and zero as the error index.
+
+				If the full response would exceed Vector's local SNMP message size limit, Vector
+				sends the [RFC 3416](\(urls.rfc_3416)) `tooBig` alternate response with an empty
+				variable-binding list. If Vector cannot forward the inform event, no Response-PDU
+				is sent so the manager can retry according to its own InformRequest timeout policy.
+				"""
+		}
 
 		community_strings: {
 			title: "Community Strings"
@@ -271,7 +288,7 @@ components: sources: snmp_trap: {
 				hexadecimal, and `value_bytes_hex` preserves the original bytes for OCTET STRING,
 				BIT STRING, Opaque, NsapAddress, and unknown BER values.
 
-				For SNMPv2c traps, [RFC 3416](\(urls.rfc_3416)) requires the first
+				For SNMPv2c traps and informs, [RFC 3416](\(urls.rfc_3416)) requires the first
 				two varbinds to be `sysUpTime.0` and `snmpTrapOID.0`, in that order. Vector
 				rejects SNMPv2c notifications that do not follow that ordering or use the wrong
 				value types.

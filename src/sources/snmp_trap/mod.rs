@@ -16,7 +16,8 @@ use crate::{
     config::{DataType, GenerateConfig, Resource, SourceConfig, SourceContext, SourceOutput},
     event::Event,
     internal_events::{
-        SocketBindError, SocketEventsReceived, SocketMode, SocketReceiveError, StreamClosedError,
+        SocketBindError, SocketBytesSent, SocketEventsReceived, SocketMode, SocketReceiveError,
+        SocketSendError, StreamClosedError,
     },
     net,
     shutdown::ShutdownSignal,
@@ -269,6 +270,28 @@ async fn snmp_trap_udp(
                             }
                             _ = &mut shutdown => return Ok(()),
                         }
+
+                        if let Some(response) = notification.response.take() {
+                            tokio::select! {
+                                result = socket.send_to(&response, peer_addr) => {
+                                    match result {
+                                        Ok(byte_size) => {
+                                            emit!(SocketBytesSent {
+                                                mode: SocketMode::Udp,
+                                                byte_size,
+                                            });
+                                        }
+                                        Err(error) => {
+                                            emit!(SocketSendError {
+                                                mode: SocketMode::Udp,
+                                                error: &error,
+                                            });
+                                        }
+                                    }
+                                }
+                                _ = &mut shutdown => return Ok(()),
+                            }
+                        }
                     }
                     Err(error) => {
                         emit!(crate::internal_events::SnmpTrapParseError {
@@ -309,7 +332,7 @@ fn enrich_events(
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use snmp_parser::snmp::PduType;
+    use snmp_parser::snmp::{PduType, SnmpPdu};
     use tokio::{
         net::UdpSocket,
         time::{Duration, Instant, sleep, timeout},
@@ -559,7 +582,11 @@ mod tests {
             tokio::spawn(config.build(context).await.unwrap());
 
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            for message in [v1_trap(), v2c_notification(PduType::TrapV2)] {
+            for message in [
+                v1_trap(),
+                v2c_notification(PduType::TrapV2),
+                v2c_notification(PduType::InformRequest),
+            ] {
                 socket.send_to(&message, addr).await.unwrap();
                 let event = timeout(Duration::from_secs(2), rx.next())
                     .await
@@ -593,6 +620,99 @@ mod tests {
                 .await;
             shutdown_complete.await;
         }
+    }
+
+    #[tokio::test]
+    async fn test_udp_source_acknowledges_inform_request() {
+        let (_guard, addr) = next_addr();
+        let config = SnmpTrapConfig {
+            address: SocketListenAddr::SocketAddr(addr),
+            receive_buffer_bytes: None,
+            host_key: None,
+            log_namespace: None,
+        };
+
+        let key = ComponentKey::from("snmp_trap");
+        let (tx, mut rx) = SourceSender::new_test();
+        let (context, shutdown) = SourceContext::new_shutdown(&key, tx);
+        let shutdown_complete = shutdown.shutdown_tripwire();
+
+        let source = config.build(context).await.unwrap();
+        tokio::spawn(source);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(addr).await.unwrap();
+        socket
+            .send(&v2c_notification(PduType::InformRequest))
+            .await
+            .unwrap();
+
+        let mut response = vec![0; MAX_SNMP_MESSAGE_SIZE];
+        let response_len = timeout(Duration::from_secs(2), socket.recv(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, response) = snmp_parser::parse_snmp_v2c(&response[..response_len]).unwrap();
+        match response.pdu {
+            SnmpPdu::Generic(pdu) => {
+                assert_eq!(pdu.pdu_type, PduType::Response);
+                assert_eq!(pdu.req_id, 42);
+                assert_eq!(pdu.err_index, 0);
+                assert_eq!(pdu.var.len(), 3);
+            }
+            other => panic!("expected response PDU, got {other:?}"),
+        }
+
+        let event = timeout(Duration::from_secs(2), rx.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.as_log()["pdu_type"], "inform_request".into());
+
+        shutdown
+            .shutdown_all(Some(Instant::now() + Duration::from_millis(100)))
+            .await;
+        shutdown_complete.await;
+    }
+
+    #[tokio::test]
+    async fn test_udp_source_does_not_ack_when_downstream_is_closed() {
+        let (_guard, addr) = next_addr();
+        let config = SnmpTrapConfig {
+            address: SocketListenAddr::SocketAddr(addr),
+            receive_buffer_bytes: None,
+            host_key: None,
+            log_namespace: None,
+        };
+
+        let key = ComponentKey::from("snmp_trap");
+        let (tx, rx) = SourceSender::new_test();
+        drop(rx);
+        let (context, _shutdown) = SourceContext::new_shutdown(&key, tx);
+
+        let source = config.build(context).await.unwrap();
+        let source = tokio::spawn(source);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(addr).await.unwrap();
+        socket
+            .send(&v2c_notification(PduType::InformRequest))
+            .await
+            .unwrap();
+
+        timeout(Duration::from_secs(2), source)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let mut response = vec![0; MAX_SNMP_MESSAGE_SIZE];
+        assert!(
+            timeout(Duration::from_millis(300), socket.recv(&mut response))
+                .await
+                .is_err(),
+            "inform should not be acknowledged when Vector cannot forward the event"
+        );
     }
 
     #[tokio::test]
@@ -634,6 +754,58 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_udp_source_rejects_malformed_inform_request_without_ack() {
+        let (_guard, addr) = next_addr();
+        let config = SnmpTrapConfig {
+            address: SocketListenAddr::SocketAddr(addr),
+            receive_buffer_bytes: None,
+            host_key: None,
+            log_namespace: None,
+        };
+
+        let key = ComponentKey::from("snmp_trap");
+        let (tx, mut rx) = SourceSender::new_test();
+        let (context, shutdown) = SourceContext::new_shutdown(&key, tx);
+        let shutdown_complete = shutdown.shutdown_tripwire();
+
+        let source = config.build(context).await.unwrap();
+        tokio::spawn(source);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.connect(addr).await.unwrap();
+        socket
+            .send(&v2c_message(
+                PduType::InformRequest,
+                42,
+                vec![varbind(
+                    &[1, 3, 6, 1, 4, 1, 8072, 2, 4, 1, 0],
+                    encode_integer(7),
+                )],
+            ))
+            .await
+            .unwrap();
+
+        let mut response = vec![0; MAX_SNMP_MESSAGE_SIZE];
+        assert!(
+            timeout(Duration::from_millis(300), socket.recv(&mut response))
+                .await
+                .is_err(),
+            "malformed inform should not receive an RFC 3416 Response-PDU"
+        );
+        assert!(
+            timeout(Duration::from_millis(300), rx.next())
+                .await
+                .is_err(),
+            "malformed inform should not produce an event"
+        );
+
+        shutdown
+            .shutdown_all(Some(Instant::now() + Duration::from_millis(100)))
+            .await;
+        shutdown_complete.await;
     }
 
     #[tokio::test]

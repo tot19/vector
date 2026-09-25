@@ -22,6 +22,7 @@ const SNMP_TRAP_OID: &str = "1.3.6.1.6.3.1.1.4.1.0";
 #[derive(Debug)]
 pub(crate) struct ParsedSnmpNotification {
     pub events: SmallVec<[Event; 1]>,
+    pub response: Option<Bytes>,
 }
 
 #[derive(Debug)]
@@ -181,6 +182,7 @@ fn parse_v1_trap(
 
             Ok(ParsedSnmpNotification {
                 events: smallvec![Event::Log(log)],
+                response: None,
             })
         }
         other => Err(ParseError::InvalidPduType(other.pdu_type())),
@@ -194,13 +196,21 @@ fn parse_v2c_notification(
     source_addr: SocketAddr,
 ) -> Result<ParsedSnmpNotification, ParseError> {
     match message.pdu {
-        SnmpPdu::Generic(ref pdu) if pdu.pdu_type == PduType::TrapV2 => {
+        SnmpPdu::Generic(ref pdu)
+            if pdu.pdu_type == PduType::TrapV2 || pdu.pdu_type == PduType::InformRequest =>
+        {
+            let notification_kind = match pdu.pdu_type {
+                PduType::TrapV2 => "trap_v2",
+                PduType::InformRequest => "inform_request",
+                _ => unreachable!(),
+            };
+
             let mut log = LogEvent::default();
             let (uptime, trap_oid) = validate_v2c_notification_varbinds(pdu)?;
             let raw_varbinds = raw_varbind_list(data, V2C_FIELDS_BEFORE_VARBINDS)?;
 
             log.insert(event_path!("snmp_version"), "2c");
-            log.insert(event_path!("pdu_type"), "trap_v2");
+            log.insert(event_path!("pdu_type"), notification_kind);
             log.insert(event_path!("source_address"), source_addr.to_string());
             log.insert(event_path!("community"), message.community.as_str());
             log.insert(event_path!("request_id"), request_id);
@@ -212,11 +222,31 @@ fn parse_v2c_notification(
             );
             log.insert(
                 event_path!("message"),
-                format!("SNMPv2c trap from {source_addr}: {trap_oid}"),
+                format!(
+                    "SNMPv2c {} from {}: {}",
+                    if pdu.pdu_type == PduType::InformRequest {
+                        "inform"
+                    } else {
+                        "trap"
+                    },
+                    source_addr,
+                    trap_oid
+                ),
             );
+
+            let response = (pdu.pdu_type == PduType::InformRequest)
+                .then(|| {
+                    build_inform_response(
+                        message.community.as_bytes(),
+                        request_id,
+                        raw_varbinds.list,
+                    )
+                })
+                .flatten();
 
             Ok(ParsedSnmpNotification {
                 events: smallvec![Event::Log(log)],
+                response,
             })
         }
         other => Err(ParseError::InvalidPduType(other.pdu_type())),
@@ -350,8 +380,9 @@ const V1_FIELDS_BEFORE_VARBINDS: usize = 5;
 /// Number of PDU fields preceding the VarBindList in an SNMPv2 PDU (RFC 3416).
 const V2C_FIELDS_BEFORE_VARBINDS: usize = 3;
 
-/// The raw value TLV of each variable binding in a message.
+/// The encoded VarBindList of a message, along with the raw value TLV of each variable binding.
 struct RawVarbinds<'a> {
+    list: &'a [u8],
     values: Vec<BerTlv<'a>>,
 }
 
@@ -372,7 +403,10 @@ fn raw_varbind_list(data: &[u8], fields_before: usize) -> Result<RawVarbinds<'_>
         varbind_offset = varbind.tlv_end;
     }
 
-    Ok(RawVarbinds { values })
+    Ok(RawVarbinds {
+        list: &data[offset..list.tlv_end],
+        values,
+    })
 }
 
 /// Detects SNMPv1 and SNMPv2c messages rejected only because their community is not UTF-8, so that
@@ -730,17 +764,47 @@ const fn trap_type_name(value: u8) -> &'static str {
     }
 }
 
-#[cfg(test)]
+/// Builds the RFC 3416 section 4.2.7 Response-PDU for an InformRequest. The request's encoded
+/// VarBindList is copied as-is so that the response carries exactly the same variable bindings.
+fn build_inform_response(community: &[u8], request_id: i64, varbind_list: &[u8]) -> Option<Bytes> {
+    let response = build_v2c_response(community, request_id, 0, varbind_list);
+
+    if response.len() <= MAX_SNMP_MESSAGE_SIZE {
+        Some(response)
+    } else {
+        let response = build_v2c_response(community, request_id, 1, &encode_sequence(&[]));
+        (response.len() <= MAX_SNMP_MESSAGE_SIZE).then_some(response)
+    }
+}
+
+fn build_v2c_response(
+    community: &[u8],
+    request_id: i64,
+    error_status: i64,
+    varbind_list: &[u8],
+) -> Bytes {
+    let mut pdu = Vec::new();
+    pdu.extend(encode_integer_i64(request_id));
+    pdu.extend(encode_integer_i64(error_status));
+    pdu.extend(encode_integer_i64(0));
+    pdu.extend_from_slice(varbind_list);
+
+    let mut message = Vec::new();
+    message.extend(encode_integer_u64(1));
+    message.extend(encode_tlv(0x04, community));
+    message.extend(encode_tlv(0xa2, &pdu));
+
+    Bytes::from(encode_sequence(&message))
+}
+
 fn encode_sequence(content: &[u8]) -> Vec<u8> {
     encode_tlv(0x30, content)
 }
 
-#[cfg(test)]
 fn encode_integer_u64(value: u64) -> Vec<u8> {
     encode_tlv(0x02, &encode_unsigned_integer_content(value))
 }
 
-#[cfg(test)]
 fn encode_integer_i64(value: i64) -> Vec<u8> {
     let bytes = value.to_be_bytes();
     let mut start = 0;
@@ -756,7 +820,6 @@ fn encode_integer_i64(value: i64) -> Vec<u8> {
     encode_tlv(0x02, &bytes[start..])
 }
 
-#[cfg(test)]
 fn encode_unsigned_integer_content(value: u64) -> Vec<u8> {
     let bytes = value.to_be_bytes();
     let first_non_zero = bytes
@@ -770,7 +833,6 @@ fn encode_unsigned_integer_content(value: u64) -> Vec<u8> {
     content
 }
 
-#[cfg(test)]
 fn encode_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     let mut value = Vec::with_capacity(1 + 5 + content.len());
     value.push(tag);
@@ -779,7 +841,6 @@ fn encode_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     value
 }
 
-#[cfg(test)]
 fn encode_length(length: usize, output: &mut Vec<u8>) {
     if length < 128 {
         output.push(length as u8);
@@ -799,7 +860,7 @@ fn encode_length(length: usize, output: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use snmp_parser::snmp::PduType;
+    use snmp_parser::snmp::{ErrorStatus, PduType};
     use std::net::{IpAddr, Ipv4Addr};
     use vector_lib::{event::Value, lookup::path};
 
@@ -848,6 +909,15 @@ mod tests {
 
     fn opaque(value: &[u8]) -> Vec<u8> {
         encode_tlv(0x44, value)
+    }
+
+    /// Encodes an `[APPLICATION tag]` value using the high-tag-number form (tags 31 to 127).
+    fn high_tag_application(tag: u8, value: &[u8]) -> Vec<u8> {
+        assert!((31..128).contains(&tag));
+        let mut encoded = vec![0x5f, tag];
+        encode_length(value.len(), &mut encoded);
+        encoded.extend(value);
+        encoded
     }
 
     fn varbind(oid_arcs: &[u64], value: Vec<u8>) -> Vec<u8> {
@@ -1014,6 +1084,7 @@ mod tests {
     #[test]
     fn test_parse_v1_trap() {
         let parsed = parse_snmp_trap(&v1_trap(), source_addr()).unwrap();
+        assert!(parsed.response.is_none());
 
         let log = parsed.events[0].as_log();
         assert_eq!(log["snmp_version"], Value::from("1"));
@@ -1054,6 +1125,7 @@ mod tests {
     #[test]
     fn test_parse_v2c_trap() {
         let parsed = parse_snmp_trap(&v2c_notification(PduType::TrapV2), source_addr()).unwrap();
+        assert!(parsed.response.is_none());
 
         let log = parsed.events[0].as_log();
         assert_eq!(log["snmp_version"], Value::from("2c"));
@@ -1075,10 +1147,30 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v2c_trap_preserves_negative_request_id() {
+    fn test_parse_v2c_inform_builds_response() {
+        let parsed =
+            parse_snmp_trap(&v2c_notification(PduType::InformRequest), source_addr()).unwrap();
+        let response = parsed.response.expect("inform should produce a response");
+
+        let (_, response) = parse_snmp_v2c(&response).unwrap();
+        assert_eq!(response.community, "public");
+        match response.pdu {
+            SnmpPdu::Generic(pdu) => {
+                assert_eq!(pdu.pdu_type, PduType::Response);
+                assert_eq!(pdu.req_id, 42);
+                assert_eq!(pdu.err, ErrorStatus::NoError);
+                assert_eq!(pdu.err_index, 0);
+                assert_eq!(pdu.var.len(), 3);
+            }
+            other => panic!("expected response PDU, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_v2c_inform_preserves_negative_request_id() {
         let parsed = parse_snmp_trap(
             &v2c_message_with_request_id(
-                PduType::TrapV2,
+                PduType::InformRequest,
                 signed_integer(-1),
                 b"public",
                 notification_varbinds(),
@@ -1088,13 +1180,20 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed.events[0].as_log()["request_id"], Value::from(-1));
+        let response = parsed.response.expect("inform should produce a response");
+        assert!(
+            response
+                .windows([0x02, 0x01, 0xff].len())
+                .any(|window| window == [0x02, 0x01, 0xff]),
+            "response should echo request-id -1 using the original signed BER integer"
+        );
     }
 
     #[test]
-    fn test_parse_v2c_trap_rejects_positive_request_id_outside_integer32() {
+    fn test_parse_v2c_inform_rejects_positive_request_id_outside_integer32() {
         let result = parse_snmp_trap(
             &v2c_message_with_request_id(
-                PduType::TrapV2,
+                PduType::InformRequest,
                 encode_tlv(0x02, &[0x00, 0x80, 0x00, 0x00, 0x00]),
                 b"public",
                 notification_varbinds(),
@@ -1102,6 +1201,62 @@ mod tests {
             source_addr(),
         );
         assert!(matches!(result, Err(ParseError::InvalidRequestId(_))));
+    }
+
+    #[test]
+    fn test_parse_v2c_inform_too_big_response() {
+        let oversized_value = vec![b'x'; MAX_SNMP_MESSAGE_SIZE];
+        let parsed = parse_snmp_trap(
+            &v2c_message(
+                PduType::InformRequest,
+                42,
+                vec![
+                    varbind(&[1, 3, 6, 1, 2, 1, 1, 3, 0], timeticks(123_456)),
+                    varbind(
+                        &[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0],
+                        oid_value(&[1, 3, 6, 1, 4, 1, 8072, 2, 3, 0, 1]),
+                    ),
+                    varbind(
+                        &[1, 3, 6, 1, 4, 1, 8072, 2, 4, 1, 0],
+                        octet_string(&oversized_value),
+                    ),
+                ],
+            ),
+            source_addr(),
+        )
+        .unwrap();
+        let response = parsed
+            .response
+            .expect("inform should produce a tooBig response");
+
+        let (_, response) = parse_snmp_v2c(&response).unwrap();
+        match response.pdu {
+            SnmpPdu::Generic(pdu) => {
+                assert_eq!(pdu.pdu_type, PduType::Response);
+                assert_eq!(pdu.req_id, 42);
+                assert_eq!(pdu.err, ErrorStatus::TooBig);
+                assert_eq!(pdu.err_index, 0);
+                assert!(pdu.var.is_empty());
+            }
+            other => panic!("expected response PDU, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_v2c_inform_drops_too_big_response_when_alternate_is_too_large() {
+        let community = vec![b'x'; MAX_SNMP_MESSAGE_SIZE];
+        let parsed = parse_snmp_trap(
+            &v2c_message_with_request_id(
+                PduType::InformRequest,
+                integer(42),
+                &community,
+                required_notification_varbinds(),
+            ),
+            source_addr(),
+        )
+        .unwrap();
+
+        assert!(parsed.response.is_none());
     }
 
     #[test]
@@ -1249,6 +1404,36 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_v2c_inform_preserves_high_tag_unknown_varbinds() {
+        let parsed = parse_snmp_trap(
+            &v2c_message(
+                PduType::InformRequest,
+                42,
+                vec![
+                    varbind(&[1, 3, 6, 1, 2, 1, 1, 3, 0], timeticks(123_456)),
+                    varbind(
+                        &[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0],
+                        oid_value(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]),
+                    ),
+                    varbind(
+                        &[1, 3, 6, 1, 2, 1, 1, 103, 0],
+                        high_tag_application(31, &[0xab, 0xcd]),
+                    ),
+                ],
+            ),
+            source_addr(),
+        )
+        .unwrap();
+
+        let response = parsed.response.expect("inform should produce a response");
+        assert!(
+            response
+                .windows([0x5f, 0x1f, 0x02, 0xab, 0xcd].len())
+                .any(|window| window == [0x5f, 0x1f, 0x02, 0xab, 0xcd])
+        );
+    }
+
+    #[test]
     fn test_parse_v2c_get_request_rejected() {
         let result = parse_snmp_trap(
             &v2c_message(
@@ -1320,6 +1505,70 @@ mod tests {
 
         let result = parse_snmp_trap(&data, source_addr());
         assert!(matches!(result, Err(ParseError::InvalidCommunity)));
+    }
+
+    /// Returns the encoded VarBindList of a v2c message: the fourth element of its PDU.
+    fn varbind_list_bytes(message: &[u8]) -> &[u8] {
+        let (_, _, pdu) = raw_message_fields(message).unwrap();
+        let mut offset = pdu.content_start;
+        for _ in 0..3 {
+            offset = read_tlv_at(message, offset).unwrap().tlv_end;
+        }
+        let varbinds = read_tlv_at(message, offset).unwrap();
+        &message[offset..varbinds.tlv_end]
+    }
+
+    #[test]
+    fn test_inform_response_echoes_every_value_type_byte_for_byte() {
+        let request = v2c_message(
+            PduType::InformRequest,
+            7,
+            vec![
+                varbind(&[1, 3, 6, 1, 2, 1, 1, 3, 0], timeticks(123_456)),
+                varbind(
+                    &[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0],
+                    oid_value(&[1, 3, 6, 1, 4, 1, 8072, 2, 3, 0, 1]),
+                ),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 1], signed_integer(-129)),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 2], integer(0)),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 3], octet_string(&[0x00, 0xff, 0x80])),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 4], encode_tlv(0x05, &[])),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 5], encode_tlv(0x40, &[10, 0, 0, 1])),
+                varbind(
+                    &[1, 3, 6, 1, 4, 1, 1, 6],
+                    encode_tlv(0x41, &[0x00, 0x80, 0x00, 0x00, 0x00]),
+                ),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 7], encode_tlv(0x42, &[0x7f])),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 8], encode_tlv(0x44, &[0xde, 0xad])),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 9], encode_tlv(0x45, &[0x01, 0x02])),
+                varbind(
+                    &[1, 3, 6, 1, 4, 1, 1, 10],
+                    encode_tlv(
+                        0x46,
+                        &[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+                    ),
+                ),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 11], encode_tlv(0x47, &[0x01, 0x00])),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 12], encode_tlv(0x03, &[0x04, 0xf0])),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 13], encode_tlv(0x80, &[])),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 14], encode_tlv(0x81, &[])),
+                varbind(&[1, 3, 6, 1, 4, 1, 1, 15], encode_tlv(0x82, &[])),
+                varbind(&[1, 3, 6, 1, 4, 1, 4294967295, 1], integer(1)),
+            ],
+        );
+
+        let parsed = parse_snmp_trap(&request, source_addr()).unwrap();
+        let response = parsed.response.expect("inform should produce a response");
+
+        assert_eq!(varbind_list_bytes(&response), varbind_list_bytes(&request));
+        let (_, response) = parse_snmp_v2c(&response).unwrap();
+        match response.pdu {
+            SnmpPdu::Generic(pdu) => {
+                assert_eq!(pdu.pdu_type, PduType::Response);
+                assert_eq!(pdu.req_id, 7);
+            }
+            other => panic!("expected response PDU, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1497,8 +1746,9 @@ mod tests {
             vec![
                 v1_trap(),
                 v2c_notification(PduType::TrapV2),
+                v2c_notification(PduType::InformRequest),
                 v2c_message_with_request_id(
-                    PduType::TrapV2,
+                    PduType::InformRequest,
                     signed_integer(-5),
                     b"public",
                     notification_varbinds(),
@@ -1509,6 +1759,21 @@ mod tests {
         fn assert_well_formed(result: Result<ParsedSnmpNotification, ParseError>) {
             if let Ok(parsed) = result {
                 assert_eq!(parsed.events.len(), 1);
+                if let Some(response) = parsed.response {
+                    // snmp-parser cannot decode negative request-ids, so decode those the same
+                    // way the source does.
+                    let response = match patch_negative_v2c_request_id(&response).unwrap() {
+                        Some((patched, _)) => patched,
+                        None => response,
+                    };
+                    let (remaining, response) = parse_snmp_v2c(&response)
+                        .expect("inform responses must be valid SNMPv2c messages");
+                    assert!(remaining.is_empty());
+                    assert!(matches!(
+                        response.pdu,
+                        SnmpPdu::Generic(ref pdu) if pdu.pdu_type == PduType::Response
+                    ));
+                }
             }
         }
 
@@ -1523,7 +1788,7 @@ mod tests {
 
             #[test]
             fn corrupted_valid_messages_never_panic(
-                message in 0usize..3,
+                message in 0usize..4,
                 edits in proptest::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..8),
                 truncate in any::<prop::sample::Index>(),
                 should_truncate in any::<bool>(),

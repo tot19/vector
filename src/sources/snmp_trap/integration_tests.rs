@@ -325,6 +325,52 @@ async fn net_snmp_multiple_v2c_traps_are_ingested_by_one_source() {
 }
 
 #[tokio::test]
+async fn net_snmp_v2c_inform_receives_response_and_is_ingested() {
+    let mut source = start_source().await;
+    let target = net_snmp_target(source.address);
+
+    let args = vec![
+        "-Ci".into(),
+        "-v".into(),
+        "2c".into(),
+        "-c".into(),
+        "public".into(),
+        "-t".into(),
+        "1".into(),
+        "-r".into(),
+        "0".into(),
+        target,
+        String::new(),
+        TRAP_OID.into(),
+        VALUE_OID.into(),
+        "i".into(),
+        "9".into(),
+    ];
+    let command = tokio::task::spawn_blocking(move || run_net_snmp("snmptrap", &args));
+
+    let log = next_log(&mut source.events).await;
+    assert_eq!(log["snmp_version"], Value::from("2c"));
+    assert_eq!(log["pdu_type"], Value::from("inform_request"));
+    assert_eq!(log["trap_oid"], Value::from(TRAP_OID_NO_DOT));
+    assert!(log["request_id"].as_integer().is_some());
+
+    let output = tokio::time::timeout(Duration::from_secs(3), command)
+        .await
+        .expect("snmptrap -Ci should finish after receiving Vector's response")
+        .expect("snmptrap -Ci task should not panic");
+
+    assert!(
+        !String::from_utf8_lossy(&output.stderr)
+            .to_ascii_lowercase()
+            .contains("timeout"),
+        "snmptrap -Ci should receive Vector's RFC 3416 response, stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    source.stop().await;
+}
+
+#[tokio::test]
 async fn net_snmp_v1_enterprise_specific_trap_is_ingested() {
     let mut source = start_source().await;
     let target = net_snmp_target(source.address);
