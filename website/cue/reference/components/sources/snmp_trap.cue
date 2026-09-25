@@ -45,7 +45,7 @@ components: sources: snmp_trap: {
 				This source supports SNMPv1 and SNMPv2c notifications only. SNMPv3 messages are rejected because [RFC 3414](\(urls.rfc_3414)) USM authentication and timeliness checks, and [RFC 3826](\(urls.rfc_3826)) AES privacy handling, are not implemented.
 				""",
 			"""
-				This source acknowledges SNMPv2c InformRequest-PDUs from any sender after Vector accepts the event for forwarding. Because InformRequest responses echo request varbinds to the claimed source address, an internet-exposed listener can act as a UDP reflection target. Place the source behind network ACLs or firewall rules appropriate for plaintext SNMPv1 and SNMPv2c traffic.
+				This source acknowledges SNMPv2c InformRequest-PDUs after Vector accepts the event for forwarding. Unless `communities` is set, informs from any sender are acknowledged. Because InformRequest responses echo request varbinds to the claimed source address, an internet-exposed listener can act as a UDP reflection target. Set `communities` and place the source behind network ACLs or firewall rules appropriate for plaintext SNMPv1 and SNMPv2c traffic.
 				""",
 		]
 	}
@@ -387,6 +387,10 @@ components: sources: snmp_trap: {
 		community_strings: {
 			title: "Community Strings"
 			body: """
+				Use `communities` to accept only messages carrying one of the listed community
+				strings. Messages with other communities are dropped before any event is created,
+				informs from them are not acknowledged, and each rejection increments
+				`component_errors_total` with `error_type` set to `authentication_failed`.
 				Messages whose community string is not valid UTF-8 are rejected as parse errors.
 
 				SNMP community strings are included in the parsed output. SNMPv1 and SNMPv2c

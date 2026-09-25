@@ -8,7 +8,7 @@ use snmp_parser::{
         VarBindValue,
     },
 };
-use std::net::SocketAddr;
+use std::{collections::HashSet, net::SocketAddr};
 use vector_lib::{
     event::{Event, LogEvent},
     lookup::event_path,
@@ -37,6 +37,7 @@ pub enum ParseError {
     InvalidV2cNotification(&'static str),
     InvalidRequestId(&'static str),
     InvalidCommunity,
+    CommunityNotAllowed,
 }
 
 impl std::fmt::Display for ParseError {
@@ -62,6 +63,12 @@ impl std::fmt::Display for ParseError {
             ParseError::InvalidCommunity => {
                 write!(f, "SNMP community string is not valid UTF-8")
             }
+            ParseError::CommunityNotAllowed => {
+                write!(
+                    f,
+                    "SNMP community string is not in the configured `communities` list"
+                )
+            }
         }
     }
 }
@@ -79,6 +86,36 @@ impl ParseError {
             ParseError::InvalidV2cNotification(_) => "invalid_v2c_notification",
             ParseError::InvalidRequestId(_) => "invalid_request_id",
             ParseError::InvalidCommunity => "invalid_community",
+            ParseError::CommunityNotAllowed => "community_not_allowed",
+        }
+    }
+}
+
+/// The set of community strings a source accepts.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CommunityFilter {
+    allowed: Option<HashSet<Vec<u8>>>,
+}
+
+impl CommunityFilter {
+    /// Accepts only the given communities, or every community when `communities` is `None`.
+    pub(crate) fn new<'a>(communities: Option<impl IntoIterator<Item = &'a str>>) -> Self {
+        Self {
+            allowed: communities.map(|communities| {
+                communities
+                    .into_iter()
+                    .map(|community| community.as_bytes().to_vec())
+                    .collect()
+            }),
+        }
+    }
+
+    fn check(&self, community: &str) -> Result<(), ParseError> {
+        match &self.allowed {
+            Some(allowed) if !allowed.contains(community.as_bytes()) => {
+                Err(ParseError::CommunityNotAllowed)
+            }
+            _ => Ok(()),
         }
     }
 }
@@ -87,14 +124,17 @@ pub fn parse_snmp_trap(
     data: &Bytes,
     source_addr: SocketAddr,
     mib_resolver: &MibResolver,
+    communities: &CommunityFilter,
 ) -> Result<ParsedSnmpNotification, ParseError> {
     if let Ok((remaining, message)) = parse_snmp_v1(data) {
         ensure_consumed(remaining)?;
+        communities.check(&message.community)?;
         return parse_v1_trap(message, data, source_addr, mib_resolver);
     }
 
     if let Ok((remaining, message)) = parse_snmp_v2c(data) {
         ensure_consumed(remaining)?;
+        communities.check(&message.community)?;
         let request_id = raw_v2c_request_id(data)?;
         return parse_v2c_notification(message, data, request_id, source_addr, mib_resolver);
     }
@@ -103,6 +143,7 @@ pub fn parse_snmp_trap(
         && let Ok((remaining, message)) = parse_snmp_v2c(&patched)
     {
         ensure_consumed(remaining)?;
+        communities.check(&message.community)?;
         return parse_v2c_notification(message, data, request_id, source_addr, mib_resolver);
     }
 
@@ -1147,7 +1188,13 @@ mod tests {
 
     #[test]
     fn test_parse_v1_trap() {
-        let parsed = parse_snmp_trap(&v1_trap(), source_addr(), &mib_resolver()).unwrap();
+        let parsed = parse_snmp_trap(
+            &v1_trap(),
+            source_addr(),
+            &mib_resolver(),
+            &CommunityFilter::default(),
+        )
+        .unwrap();
         assert!(parsed.response.is_none());
 
         let log = parsed.events[0].as_log();
@@ -1170,6 +1217,7 @@ mod tests {
             &v1_trap_with_generic_trap(integer(2)),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         )
         .unwrap();
 
@@ -1185,6 +1233,7 @@ mod tests {
             &v1_trap_with_generic_trap(integer(7)),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         );
         assert!(matches!(result, Err(ParseError::InvalidV1Trap(_))));
     }
@@ -1195,6 +1244,7 @@ mod tests {
             &v1_trap_with_generic_trap(integer(256)),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         );
         assert!(matches!(result, Err(ParseError::InvalidV1Trap(_))));
     }
@@ -1202,7 +1252,13 @@ mod tests {
     #[test]
     fn test_parse_v1_trap_with_mib_resolution() {
         let resolver = MibResolver::from_str(TEST_MIB);
-        let parsed = parse_snmp_trap(&v1_trap(), source_addr(), &resolver).unwrap();
+        let parsed = parse_snmp_trap(
+            &v1_trap(),
+            source_addr(),
+            &resolver,
+            &CommunityFilter::default(),
+        )
+        .unwrap();
 
         let log = parsed.events[0].as_log();
         assert_eq!(
@@ -1219,6 +1275,7 @@ mod tests {
             &v2c_notification(PduType::TrapV2),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         )
         .unwrap();
         assert!(parsed.response.is_none());
@@ -1250,8 +1307,13 @@ mod tests {
     #[test]
     fn test_parse_v2c_trap_with_mib_resolution() {
         let resolver = MibResolver::from_str(TEST_MIB);
-        let parsed =
-            parse_snmp_trap(&v2c_notification(PduType::TrapV2), source_addr(), &resolver).unwrap();
+        let parsed = parse_snmp_trap(
+            &v2c_notification(PduType::TrapV2),
+            source_addr(),
+            &resolver,
+            &CommunityFilter::default(),
+        )
+        .unwrap();
 
         let log = parsed.events[0].as_log();
         assert_eq!(log["trap_oid_name"], Value::from("TEST-MIB::testTrap"));
@@ -1283,6 +1345,7 @@ mod tests {
             &v2c_notification(PduType::InformRequest),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         )
         .unwrap();
         let response = parsed.response.expect("inform should produce a response");
@@ -1312,6 +1375,7 @@ mod tests {
             ),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         )
         .unwrap();
 
@@ -1336,6 +1400,7 @@ mod tests {
             ),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         );
         assert!(matches!(result, Err(ParseError::InvalidRequestId(_))));
     }
@@ -1361,6 +1426,7 @@ mod tests {
             ),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         )
         .unwrap();
         let response = parsed
@@ -1392,6 +1458,7 @@ mod tests {
             ),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         )
         .unwrap();
 
@@ -1417,6 +1484,7 @@ mod tests {
             ),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         )
         .unwrap();
 
@@ -1456,6 +1524,7 @@ mod tests {
             ),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         )
         .unwrap();
 
@@ -1488,6 +1557,7 @@ mod tests {
             ),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         );
         assert!(matches!(
             result,
@@ -1513,6 +1583,7 @@ mod tests {
             ),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         );
         assert!(matches!(
             result,
@@ -1538,6 +1609,7 @@ mod tests {
             ),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         );
         assert!(matches!(
             result,
@@ -1567,6 +1639,7 @@ mod tests {
             ),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         )
         .unwrap();
 
@@ -1588,6 +1661,7 @@ mod tests {
             ),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         );
         assert!(matches!(
             result,
@@ -1599,13 +1673,24 @@ mod tests {
     fn test_parse_trailing_data_rejected() {
         let mut data = v2c_notification(PduType::TrapV2).to_vec();
         data.push(0);
-        let result = parse_snmp_trap(&Bytes::from(data), source_addr(), &mib_resolver());
+        let result = parse_snmp_trap(
+            &Bytes::from(data),
+            source_addr(),
+            &mib_resolver(),
+            &CommunityFilter::default(),
+        );
         assert!(matches!(result, Err(ParseError::TrailingData(1))));
     }
 
     #[test]
     fn test_parse_v3_rejected() {
-        let error = parse_snmp_trap(&v3_trap(), source_addr(), &mib_resolver()).unwrap_err();
+        let error = parse_snmp_trap(
+            &v3_trap(),
+            source_addr(),
+            &mib_resolver(),
+            &CommunityFilter::default(),
+        )
+        .unwrap_err();
         assert!(matches!(error, ParseError::UnsupportedVersion(_)));
         assert_eq!(error.error_code(), "unsupported_version");
     }
@@ -1613,14 +1698,24 @@ mod tests {
     #[test]
     fn test_parse_invalid_data() {
         let data = Bytes::from("invalid data");
-        let result = parse_snmp_trap(&data, source_addr(), &mib_resolver());
+        let result = parse_snmp_trap(
+            &data,
+            source_addr(),
+            &mib_resolver(),
+            &CommunityFilter::default(),
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_empty_data() {
         let data = Bytes::from("");
-        let result = parse_snmp_trap(&data, source_addr(), &mib_resolver());
+        let result = parse_snmp_trap(
+            &data,
+            source_addr(),
+            &mib_resolver(),
+            &CommunityFilter::default(),
+        );
         assert!(result.is_err());
     }
 
@@ -1653,6 +1748,69 @@ testValue OBJECT-TYPE
 END
 "#;
 
+    fn allow_only(communities: &[&str]) -> CommunityFilter {
+        CommunityFilter::new(Some(communities.iter().copied()))
+    }
+
+    #[test]
+    fn test_community_filter_accepts_listed_communities() {
+        let filter = allow_only(&["other", "public"]);
+
+        for data in [v1_trap(), v2c_notification(PduType::InformRequest)] {
+            let parsed = parse_snmp_trap(&data, source_addr(), &mib_resolver(), &filter).unwrap();
+            assert_eq!(
+                parsed.events[0].as_log()["community"],
+                Value::from("public")
+            );
+        }
+    }
+
+    #[test]
+    fn test_community_filter_rejects_unlisted_communities() {
+        let filter = allow_only(&["secret"]);
+        let negative_request_id = v2c_message_with_request_id(
+            PduType::InformRequest,
+            signed_integer(-1),
+            b"public",
+            notification_varbinds(),
+        );
+
+        for data in [
+            v1_trap(),
+            v2c_notification(PduType::TrapV2),
+            v2c_notification(PduType::InformRequest),
+            negative_request_id,
+        ] {
+            let result = parse_snmp_trap(&data, source_addr(), &mib_resolver(), &filter);
+            assert!(
+                matches!(result, Err(ParseError::CommunityNotAllowed)),
+                "expected community rejection, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_community_filter_is_case_sensitive() {
+        let result = parse_snmp_trap(
+            &v2c_notification(PduType::TrapV2),
+            source_addr(),
+            &mib_resolver(),
+            &allow_only(&["PUBLIC"]),
+        );
+        assert!(matches!(result, Err(ParseError::CommunityNotAllowed)));
+    }
+
+    #[test]
+    fn test_empty_community_list_rejects_everything() {
+        let result = parse_snmp_trap(
+            &v2c_notification(PduType::TrapV2),
+            source_addr(),
+            &mib_resolver(),
+            &allow_only(&[]),
+        );
+        assert!(matches!(result, Err(ParseError::CommunityNotAllowed)));
+    }
+
     #[test]
     fn test_parse_reports_malformed_pdus_with_valid_communities_as_malformed() {
         let mut message = Vec::new();
@@ -1666,6 +1824,7 @@ END
             &Bytes::from(encode_sequence(&message)),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         );
         assert!(
             matches!(result, Err(ParseError::MalformedMessage(_))),
@@ -1682,7 +1841,12 @@ END
             notification_varbinds(),
         );
 
-        let result = parse_snmp_trap(&data, source_addr(), &mib_resolver());
+        let result = parse_snmp_trap(
+            &data,
+            source_addr(),
+            &mib_resolver(),
+            &CommunityFilter::default(),
+        );
         assert!(matches!(result, Err(ParseError::InvalidCommunity)));
     }
 
@@ -1736,7 +1900,13 @@ END
             ],
         );
 
-        let parsed = parse_snmp_trap(&request, source_addr(), &mib_resolver()).unwrap();
+        let parsed = parse_snmp_trap(
+            &request,
+            source_addr(),
+            &mib_resolver(),
+            &CommunityFilter::default(),
+        )
+        .unwrap();
         let response = parsed.response.expect("inform should produce a response");
 
         assert_eq!(varbind_list_bytes(&response), varbind_list_bytes(&request));
@@ -1775,6 +1945,7 @@ END
             &v2c_message(PduType::TrapV2, 1, varbinds),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         )
         .unwrap();
 
@@ -1914,6 +2085,7 @@ END
             &v2c_message(PduType::TrapV2, 1, varbinds),
             source_addr(),
             &mib_resolver(),
+            &CommunityFilter::default(),
         )
         .unwrap();
 
@@ -1970,7 +2142,8 @@ END
                 assert_well_formed(parse_snmp_trap(
                     &Bytes::from(data),
                     source_addr(),
-                    &MibResolver::from_str(TEST_MIB)
+                    &MibResolver::from_str(TEST_MIB),
+                    &CommunityFilter::default(),
                 ));
             }
 
@@ -1993,7 +2166,8 @@ END
                 assert_well_formed(parse_snmp_trap(
                     &Bytes::from(data),
                     source_addr(),
-                    &MibResolver::from_str(TEST_MIB)
+                    &MibResolver::from_str(TEST_MIB),
+                    &CommunityFilter::default(),
                 ));
             }
 

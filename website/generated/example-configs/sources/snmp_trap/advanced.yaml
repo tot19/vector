@@ -2,3 +2,5 @@ sources:
   my_source_id:
     type: snmp_trap
     address: 0.0.0.0:9000
+    communities:
+      - public

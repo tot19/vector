@@ -78,6 +78,7 @@ async fn start_source() -> RunningSource {
         receive_buffer_bytes: None,
         host_key: None,
         mib_paths: vec![test_mib_path()],
+        communities: None,
         log_namespace: None,
     };
 

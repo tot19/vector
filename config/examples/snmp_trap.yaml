@@ -20,6 +20,9 @@ sources:
     # Optional: load MIB files or directories recursively to resolve OID names.
     # mib_paths:
     #   - "/etc/snmp/mibs"
+    # Optional: only accept messages that use one of these community strings.
+    # communities:
+    #   - "public"
     # Optional: Set receive buffer size
     receive_buffer_bytes: 65536
 

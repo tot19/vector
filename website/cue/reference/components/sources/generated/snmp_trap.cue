@@ -10,6 +10,19 @@ generated: components: sources: snmp_trap: configuration: {
 		required: true
 		type: string: examples: ["0.0.0.0:9000", "systemd", "systemd#3", "0.0.0.0:162", "127.0.0.1:1162"]
 	}
+	communities: {
+		description: """
+			A list of SNMP community strings to accept.
+
+			When set, SNMPv1 and SNMPv2c messages whose community string is not listed are dropped:
+			they produce no events and InformRequests are not acknowledged. Each rejected message
+			increments `component_errors_total` with `error_type` set to `authentication_failed`.
+
+			By default, messages with any community string are accepted.
+			"""
+		required: false
+		type: array: items: type: string: examples: ["public"]
+	}
 	host_key: {
 		description: """
 			Overrides the name of the log field used to add the peer host to each event.

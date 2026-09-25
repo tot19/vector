@@ -9,6 +9,7 @@ use vector_lib::{
     configurable::configurable_component,
     internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol},
     lookup::{OwnedValuePath, lookup_v2::OptionalValuePath, owned_value_path, path},
+    sensitive_string::SensitiveString,
 };
 use vrl::value::{Kind, kind::Collection};
 
@@ -17,8 +18,8 @@ use crate::{
     config::{DataType, GenerateConfig, Resource, SourceConfig, SourceContext, SourceOutput},
     event::Event,
     internal_events::{
-        SocketBindError, SocketBytesSent, SocketEventsReceived, SocketMode, SocketReceiveError,
-        SocketSendError, StreamClosedError,
+        SnmpTrapCommunityNotAllowedError, SocketBindError, SocketBytesSent, SocketEventsReceived,
+        SocketMode, SocketReceiveError, SocketSendError, StreamClosedError,
     },
     net,
     shutdown::ShutdownSignal,
@@ -29,7 +30,7 @@ mod mib;
 mod parser;
 
 use mib::MibResolver;
-use parser::{MAX_SNMP_MESSAGE_SIZE, parse_snmp_trap};
+use parser::{CommunityFilter, MAX_SNMP_MESSAGE_SIZE, ParseError, parse_snmp_trap};
 
 /// Configuration for the `snmp_trap` source.
 #[configurable_component(source("snmp_trap", "Receive SNMP traps over UDP."))]
@@ -69,13 +70,35 @@ pub struct SnmpTrapConfig {
     #[serde(default)]
     mib_paths: Vec<PathBuf>,
 
+    /// A list of SNMP community strings to accept.
+    ///
+    /// When set, SNMPv1 and SNMPv2c messages whose community string is not listed are dropped:
+    /// they produce no events and InformRequests are not acknowledged. Each rejected message
+    /// increments `component_errors_total` with `error_type` set to `authentication_failed`.
+    ///
+    /// By default, messages with any community string are accepted.
+    #[configurable(metadata(docs::examples = "communities_example()"))]
+    communities: Option<Vec<SensitiveString>>,
+
     /// The namespace to use for logs. This overrides the global setting.
     #[configurable(metadata(docs::hidden))]
     #[serde(default)]
     log_namespace: Option<bool>,
 }
 
+fn communities_example() -> Vec<String> {
+    vec!["public".to_string()]
+}
+
 impl SnmpTrapConfig {
+    fn community_filter(&self) -> CommunityFilter {
+        CommunityFilter::new(
+            self.communities
+                .as_ref()
+                .map(|communities| communities.iter().map(SensitiveString::inner)),
+        )
+    }
+
     fn host_key(&self) -> Option<OwnedValuePath> {
         match &self.host_key {
             Some(host_key) => host_key.clone().path,
@@ -210,6 +233,7 @@ impl Default for SnmpTrapConfig {
             receive_buffer_bytes: None,
             host_key: None,
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         }
     }
@@ -248,6 +272,7 @@ impl SourceConfig for SnmpTrapConfig {
             self.receive_buffer_bytes,
             host_key,
             mib_resolver,
+            self.community_filter(),
             cx.shutdown,
             log_namespace,
             cx.out,
@@ -280,6 +305,7 @@ async fn snmp_trap_udp(
     receive_buffer_bytes: Option<usize>,
     host_key: Option<OwnedValuePath>,
     mib_resolver: MibResolver,
+    communities: CommunityFilter,
     shutdown: ShutdownSignal,
     log_namespace: LogNamespace,
     mut out: SourceSender,
@@ -318,7 +344,7 @@ async fn snmp_trap_udp(
                 bytes_received.emit(ByteSize(byte_size));
                 let data = Bytes::copy_from_slice(&buf[..byte_size]);
 
-                match parse_snmp_trap(&data, peer_addr, &mib_resolver) {
+                match parse_snmp_trap(&data, peer_addr, &mib_resolver, &communities) {
                     Ok(mut notification) => {
                         let count = notification.events.len();
                         emit!(SocketEventsReceived {
@@ -360,6 +386,9 @@ async fn snmp_trap_udp(
                                 _ = &mut shutdown => return Ok(()),
                             }
                         }
+                    }
+                    Err(ParseError::CommunityNotAllowed) => {
+                        emit!(SnmpTrapCommunityNotAllowedError { peer_addr });
                     }
                     Err(error) => {
                         emit!(crate::internal_events::SnmpTrapParseError {
@@ -411,7 +440,10 @@ mod tests {
         config::ComponentKey,
         test_util::{
             addr::next_addr,
-            components::{SOCKET_PUSH_SOURCE_TAGS, assert_source_compliance},
+            components::{
+                COMPONENT_ERROR_TAGS, SOCKET_PUSH_SOURCE_TAGS, assert_source_compliance,
+                assert_source_error,
+            },
         },
     };
 
@@ -444,6 +476,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: None,
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         };
 
@@ -465,6 +498,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: None,
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         };
 
@@ -496,6 +530,7 @@ mod tests {
             receive_buffer_bytes: Some(65536),
             host_key: Some(OptionalValuePath::from(host_path)),
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         };
 
@@ -515,6 +550,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: None,
             mib_paths: vec![temp_dir.path().join("missing")],
+            communities: None,
             log_namespace: None,
         };
 
@@ -536,6 +572,7 @@ mod tests {
                 receive_buffer_bytes: None,
                 host_key: None,
                 mib_paths: Vec::new(),
+                communities: None,
                 log_namespace: None,
             };
 
@@ -582,6 +619,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: Some(OptionalValuePath::from(host_path)),
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         };
 
@@ -622,6 +660,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: Some(OptionalValuePath::none()),
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         };
 
@@ -654,6 +693,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_udp_source_drops_and_does_not_acknowledge_rejected_communities() {
+        assert_source_error(&COMPONENT_ERROR_TAGS, async {
+            let (_guard, addr) = next_addr();
+            let config = SnmpTrapConfig {
+                address: SocketListenAddr::SocketAddr(addr),
+                receive_buffer_bytes: None,
+                host_key: None,
+                mib_paths: Vec::new(),
+                communities: Some(vec![SensitiveString::from("secret".to_string())]),
+                log_namespace: None,
+            };
+
+            let key = ComponentKey::from("snmp_trap");
+            let (tx, mut rx) = SourceSender::new_test();
+            let (context, shutdown) = SourceContext::new_shutdown(&key, tx);
+            let shutdown_complete = shutdown.shutdown_tripwire();
+
+            let source = config.build(context).await.unwrap();
+            tokio::spawn(source);
+
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.connect(addr).await.unwrap();
+            socket
+                .send(&v2c_notification(PduType::InformRequest))
+                .await
+                .unwrap();
+
+            let mut response = vec![0; MAX_SNMP_MESSAGE_SIZE];
+            assert!(
+                timeout(Duration::from_millis(500), socket.recv(&mut response))
+                    .await
+                    .is_err(),
+                "an inform with a rejected community must not be acknowledged"
+            );
+            assert!(
+                timeout(Duration::from_millis(100), rx.next())
+                    .await
+                    .is_err(),
+                "a message with a rejected community must not produce an event"
+            );
+
+            shutdown
+                .shutdown_all(Some(Instant::now() + Duration::from_millis(100)))
+                .await;
+            shutdown_complete.await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_events_match_schema_definition_in_both_namespaces() {
         for log_namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
             let (_guard, addr) = next_addr();
@@ -662,6 +751,7 @@ mod tests {
                 receive_buffer_bytes: None,
                 host_key: None,
                 mib_paths: Vec::new(),
+                communities: None,
                 log_namespace: Some(log_namespace == LogNamespace::Vector),
             };
             let definition = config
@@ -725,6 +815,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: None,
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         };
 
@@ -779,6 +870,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: None,
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         };
 
@@ -820,6 +912,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: None,
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         };
 
@@ -862,6 +955,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: None,
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         };
 
@@ -919,6 +1013,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: None,
             mib_paths: vec![temp_dir.path().to_path_buf()],
+            communities: None,
             log_namespace: None,
         };
 
@@ -970,6 +1065,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: None,
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         };
 
@@ -1019,6 +1115,7 @@ mod tests {
             receive_buffer_bytes: None,
             host_key: None,
             mib_paths: Vec::new(),
+            communities: None,
             log_namespace: None,
         };
 
