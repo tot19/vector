@@ -140,6 +140,7 @@ jobs:
             "prometheus",
             "pulsar",
             "redis",
+            "snmp-trap",
             "splunk",
             "webhdfs"
           ]

@@ -134,6 +134,8 @@ mod remap;
 mod sample;
 #[cfg(feature = "sinks-sematext")]
 mod sematext_metrics;
+#[cfg(feature = "sources-snmp_trap")]
+mod snmp_trap;
 mod socket;
 #[cfg(any(feature = "sources-splunk_hec", feature = "sinks-splunk_hec"))]
 mod splunk_hec;
@@ -308,3 +310,6 @@ pub use self::{
     adaptive_concurrency::*, batch::*, common::*, conditions::*, encoding_transcode::*,
     heartbeat::*, http::*, open::*, process::*, socket::*, tcp::*, template::*, udp::*,
 };
+
+#[cfg(feature = "sources-snmp_trap")]
+pub use self::snmp_trap::*;

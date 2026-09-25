@@ -9,7 +9,8 @@ RUN bash /install-debian-build-deps.sh
 
 # Provide `envsubst` (from gettext-base) so e2e compose services can render
 # config templates with environment-variable substitution at container startup.
-RUN apt-get update && apt-get install -y --no-install-recommends gettext-base && rm -rf /var/lib/apt/lists/*
+# Provide Net-SNMP's `snmptrap` (from snmp) for the snmp_trap integration tests.
+RUN apt-get update && apt-get install -y --no-install-recommends gettext-base snmp && rm -rf /var/lib/apt/lists/*
 
 COPY tests/data/ca/certs /certs
 

@@ -1,0 +1,16 @@
+features:
+- snmp-trap-integration-tests
+
+test_filter: '::snmp_trap::integration_tests::'
+
+matrix:
+  default: ["default"]
+
+# changes to these files/paths will invoke the integration test in CI
+# expressions are evaluated using https://github.com/micromatch/picomatch
+paths:
+- "src/internal_events/snmp_trap.rs"
+- "src/sources/snmp_trap/**"
+- "src/sources/util/net/**"
+- "tests/integration/snmp-trap/**"
+

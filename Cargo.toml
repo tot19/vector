@@ -222,6 +222,7 @@ serde_json = { version = "1.0.150", default-features = false, features = ["prese
 serde_path_to_error = "0.1.14"
 serde_with = { version = "3.21.0", default-features = false, features = ["std", "macros", "chrono_0_4"] }
 serde_yaml = { version = "0.9.34", default-features = false }
+snmp-parser = { version = "0.10.0", default-features = false }
 snafu = { version = "0.9.0", default-features = false, features = ["futures", "std"] }
 socket2 = { version = "0.6.3", default-features = false }
 tempfile = "3.27.0"
@@ -268,6 +269,7 @@ proptest = { workspace = true, optional = true }
 proptest-derive = { workspace = true, optional = true }
 semver.workspace = true
 snafu.workspace = true
+snmp-parser = { workspace = true, optional = true }
 uuid.workspace = true
 vrl.workspace = true
 
@@ -731,6 +733,7 @@ sources-logs = [
   "sources-pulsar",
   "sources-file_descriptor",
   "sources-redis",
+  "sources-snmp_trap",
   "sources-socket",
   "sources-splunk_hec",
   "sources-stdin",
@@ -806,6 +809,7 @@ sources-prometheus_remote_write = ["sinks-prometheus", "sources-utils-http", "ve
 sources-prometheus_pushgateway = ["sinks-prometheus", "sources-utils-http", "vector-lib/prometheus"]
 sources-pulsar = ["dep:pulsar"]
 sources-redis = ["dep:redis"]
+sources-snmp_trap = ["sources-utils-net-udp", "dep:snmp-parser", "tokio-util/net"]
 sources-socket = ["sources-utils-net", "tokio-util/net"]
 sources-splunk_hec = ["dep:roaring", "sources-utils-http-encoding"]
 sources-statsd = ["sources-utils-net", "tokio-util/net"]
@@ -1054,6 +1058,7 @@ all-integration-tests = [
   "prometheus-integration-tests",
   "pulsar-integration-tests",
   "redis-integration-tests",
+  "snmp-trap-integration-tests",
   "splunk-integration-tests",
   "vector-api-tests",
   "webhdfs-integration-tests",
@@ -1123,6 +1128,7 @@ postgres_sink-integration-tests = ["sinks-postgres"]
 prometheus-integration-tests = ["sinks-prometheus", "sources-prometheus", "sinks-influxdb"]
 pulsar-integration-tests = ["sinks-pulsar", "sources-pulsar"]
 redis-integration-tests = ["sinks-redis", "sources-redis"]
+snmp-trap-integration-tests = ["sources-snmp_trap"]
 splunk-integration-tests = ["sinks-splunk_hec"]
 dnstap-integration-tests = ["sources-dnstap", "dep:bollard"]
 webhdfs-integration-tests = ["sinks-webhdfs"]

@@ -138,6 +138,8 @@ on:
         value: ${{ jobs.int_tests.outputs.pulsar }}
       redis:
         value: ${{ jobs.int_tests.outputs.redis }}
+      snmp-trap:
+        value: ${{ jobs.int_tests.outputs.snmp-trap }}
       splunk:
         value: ${{ jobs.int_tests.outputs.splunk }}
       webhdfs:
@@ -374,6 +376,7 @@ jobs:
       prometheus: ${{ steps.filter.outputs.prometheus }}
       pulsar: ${{ steps.filter.outputs.pulsar }}
       redis: ${{ steps.filter.outputs.redis }}
+      snmp-trap: ${{ steps.filter.outputs.snmp-trap }}
       splunk: ${{ steps.filter.outputs.splunk }}
       webhdfs: ${{ steps.filter.outputs.webhdfs }}
       any: ${{ steps.detect-changes.outputs.any }}
@@ -440,6 +443,7 @@ jobs:
             "prometheus": ${{ steps.filter.outputs.prometheus }},
             "pulsar": ${{ steps.filter.outputs.pulsar }},
             "redis": ${{ steps.filter.outputs.redis }},
+            "snmp-trap": ${{ steps.filter.outputs.snmp-trap }},
             "splunk": ${{ steps.filter.outputs.splunk }},
             "webhdfs": ${{ steps.filter.outputs.webhdfs }}
           }

@@ -1,0 +1,1547 @@
+use bytes::Bytes;
+use serde_json::json;
+use smallvec::{SmallVec, smallvec};
+use snmp_parser::{
+    parse_snmp_v1, parse_snmp_v2c, parse_snmp_v3,
+    snmp::{
+        NetworkAddress, ObjectSyntax, PduType, SnmpGenericPdu, SnmpMessage, SnmpPdu, SnmpVariable,
+        VarBindValue,
+    },
+};
+use std::net::SocketAddr;
+use vector_lib::{
+    event::{Event, LogEvent},
+    lookup::event_path,
+};
+
+pub(crate) const MAX_SNMP_MESSAGE_SIZE: usize = 65_507;
+
+const SYS_UP_TIME_OID: &str = "1.3.6.1.2.1.1.3.0";
+const SNMP_TRAP_OID: &str = "1.3.6.1.6.3.1.1.4.1.0";
+
+#[derive(Debug)]
+pub(crate) struct ParsedSnmpNotification {
+    pub events: SmallVec<[Event; 1]>,
+}
+
+#[derive(Debug)]
+pub enum ParseError {
+    MalformedMessage(String),
+    UnsupportedVersion(&'static str),
+    TrailingData(usize),
+    InvalidPduType(PduType),
+    InvalidV1Trap(&'static str),
+    InvalidV2cNotification(&'static str),
+    InvalidRequestId(&'static str),
+    InvalidCommunity,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::MalformedMessage(msg) => write!(f, "failed to parse SNMP message: {msg}"),
+            ParseError::UnsupportedVersion(msg) => write!(f, "{msg}"),
+            ParseError::TrailingData(bytes) => {
+                write!(f, "SNMP message contained {bytes} trailing bytes")
+            }
+            ParseError::InvalidPduType(pdu_type) => {
+                write!(f, "invalid PDU type for SNMP notification: {pdu_type:?}")
+            }
+            ParseError::InvalidV1Trap(message) => {
+                write!(f, "invalid RFC 1157 SNMPv1 trap: {message}")
+            }
+            ParseError::InvalidV2cNotification(message) => {
+                write!(f, "invalid RFC 3416 SNMPv2 notification: {message}")
+            }
+            ParseError::InvalidRequestId(message) => {
+                write!(f, "invalid RFC 3416 request-id: {message}")
+            }
+            ParseError::InvalidCommunity => {
+                write!(f, "SNMP community string is not valid UTF-8")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+impl ParseError {
+    pub(crate) const fn error_code(&self) -> &'static str {
+        match self {
+            ParseError::MalformedMessage(_) => "malformed_message",
+            ParseError::UnsupportedVersion(_) => "unsupported_version",
+            ParseError::TrailingData(_) => "trailing_data",
+            ParseError::InvalidPduType(_) => "invalid_pdu_type",
+            ParseError::InvalidV1Trap(_) => "invalid_v1_trap",
+            ParseError::InvalidV2cNotification(_) => "invalid_v2c_notification",
+            ParseError::InvalidRequestId(_) => "invalid_request_id",
+            ParseError::InvalidCommunity => "invalid_community",
+        }
+    }
+}
+
+pub fn parse_snmp_trap(
+    data: &Bytes,
+    source_addr: SocketAddr,
+) -> Result<ParsedSnmpNotification, ParseError> {
+    if let Ok((remaining, message)) = parse_snmp_v1(data) {
+        ensure_consumed(remaining)?;
+        return parse_v1_trap(message, data, source_addr);
+    }
+
+    if let Ok((remaining, message)) = parse_snmp_v2c(data) {
+        ensure_consumed(remaining)?;
+        let request_id = raw_v2c_request_id(data)?;
+        return parse_v2c_notification(message, data, request_id, source_addr);
+    }
+
+    if let Some((patched, request_id)) = patch_negative_v2c_request_id(data)?
+        && let Ok((remaining, message)) = parse_snmp_v2c(&patched)
+    {
+        ensure_consumed(remaining)?;
+        return parse_v2c_notification(message, data, request_id, source_addr);
+    }
+
+    if parse_snmp_v3(data).is_ok() {
+        return Err(ParseError::UnsupportedVersion(
+            "SNMPv3 trap parsing is not supported because RFC 3414 authentication and timeliness checks, and RFC 3826 AES privacy handling, are not implemented",
+        ));
+    }
+
+    if has_non_utf8_community(data) {
+        return Err(ParseError::InvalidCommunity);
+    }
+
+    Err(ParseError::MalformedMessage(
+        "could not parse as SNMPv1 trap or SNMPv2c notification".to_string(),
+    ))
+}
+
+const fn ensure_consumed(remaining: &[u8]) -> Result<(), ParseError> {
+    if remaining.is_empty() {
+        Ok(())
+    } else {
+        Err(ParseError::TrailingData(remaining.len()))
+    }
+}
+
+fn parse_v1_trap(
+    message: SnmpMessage<'_>,
+    data: &Bytes,
+    source_addr: SocketAddr,
+) -> Result<ParsedSnmpNotification, ParseError> {
+    match message.pdu {
+        SnmpPdu::TrapV1(trap) => {
+            let mut log = LogEvent::default();
+            let enterprise_oid = trap.enterprise.to_string();
+            let generic_trap = raw_v1_generic_trap(data)?;
+            let generic_trap = u8::try_from(generic_trap).map_err(|_| {
+                ParseError::InvalidV1Trap("generic-trap must be in the RFC 1157 range 0..=6")
+            })?;
+            if generic_trap > 6 {
+                return Err(ParseError::InvalidV1Trap(
+                    "generic-trap must be in the RFC 1157 range 0..=6",
+                ));
+            }
+
+            log.insert(event_path!("snmp_version"), "1");
+            log.insert(event_path!("pdu_type"), "trap_v1");
+            log.insert(event_path!("source_address"), source_addr.to_string());
+            log.insert(event_path!("community"), message.community);
+            log.insert(event_path!("enterprise_oid"), enterprise_oid.as_str());
+            log.insert(
+                event_path!("agent_address"),
+                format_network_address(trap.agent_addr),
+            );
+            log.insert(event_path!("generic_trap"), generic_trap as i64);
+            log.insert(
+                event_path!("generic_trap_name"),
+                trap_type_name(generic_trap),
+            );
+            log.insert(event_path!("specific_trap"), trap.specific_trap as i64);
+            let trap_oid = v1_trap_oid(&enterprise_oid, generic_trap, trap.specific_trap);
+            log.insert(event_path!("trap_oid"), trap_oid.as_str());
+            log.insert(event_path!("uptime"), trap.timestamp as i64);
+            log.insert(
+                event_path!("varbinds"),
+                format_varbinds(
+                    &trap.var,
+                    &raw_varbind_list(data, V1_FIELDS_BEFORE_VARBINDS)?,
+                ),
+            );
+            log.insert(
+                event_path!("message"),
+                format!(
+                    "SNMPv1 trap from {} ({}): {}",
+                    source_addr,
+                    trap.enterprise,
+                    trap_type_name(generic_trap)
+                ),
+            );
+
+            Ok(ParsedSnmpNotification {
+                events: smallvec![Event::Log(log)],
+            })
+        }
+        other => Err(ParseError::InvalidPduType(other.pdu_type())),
+    }
+}
+
+fn parse_v2c_notification(
+    message: SnmpMessage<'_>,
+    data: &[u8],
+    request_id: i64,
+    source_addr: SocketAddr,
+) -> Result<ParsedSnmpNotification, ParseError> {
+    match message.pdu {
+        SnmpPdu::Generic(ref pdu) if pdu.pdu_type == PduType::TrapV2 => {
+            let mut log = LogEvent::default();
+            let (uptime, trap_oid) = validate_v2c_notification_varbinds(pdu)?;
+            let raw_varbinds = raw_varbind_list(data, V2C_FIELDS_BEFORE_VARBINDS)?;
+
+            log.insert(event_path!("snmp_version"), "2c");
+            log.insert(event_path!("pdu_type"), "trap_v2");
+            log.insert(event_path!("source_address"), source_addr.to_string());
+            log.insert(event_path!("community"), message.community.as_str());
+            log.insert(event_path!("request_id"), request_id);
+            log.insert(event_path!("uptime"), uptime);
+            log.insert(event_path!("trap_oid"), trap_oid.clone());
+            log.insert(
+                event_path!("varbinds"),
+                format_varbinds(&pdu.var, &raw_varbinds),
+            );
+            log.insert(
+                event_path!("message"),
+                format!("SNMPv2c trap from {source_addr}: {trap_oid}"),
+            );
+
+            Ok(ParsedSnmpNotification {
+                events: smallvec![Event::Log(log)],
+            })
+        }
+        other => Err(ParseError::InvalidPduType(other.pdu_type())),
+    }
+}
+
+fn validate_v2c_notification_varbinds(
+    pdu: &SnmpGenericPdu<'_>,
+) -> Result<(i64, String), ParseError> {
+    let Some(uptime) = pdu.var.first() else {
+        return Err(ParseError::InvalidV2cNotification(
+            "missing sysUpTime.0 and snmpTrapOID.0 varbinds",
+        ));
+    };
+
+    if uptime.oid.to_string() != SYS_UP_TIME_OID {
+        return Err(ParseError::InvalidV2cNotification(
+            "first varbind must be sysUpTime.0",
+        ));
+    }
+
+    let VarBindValue::Value(ObjectSyntax::TimeTicks(uptime_value)) = &uptime.val else {
+        return Err(ParseError::InvalidV2cNotification(
+            "sysUpTime.0 varbind must contain TimeTicks",
+        ));
+    };
+
+    let Some(trap_oid) = pdu.var.get(1) else {
+        return Err(ParseError::InvalidV2cNotification(
+            "missing snmpTrapOID.0 varbind",
+        ));
+    };
+
+    if trap_oid.oid.to_string() != SNMP_TRAP_OID {
+        return Err(ParseError::InvalidV2cNotification(
+            "second varbind must be snmpTrapOID.0",
+        ));
+    }
+
+    let VarBindValue::Value(ObjectSyntax::Object(trap_oid_value)) = &trap_oid.val else {
+        return Err(ParseError::InvalidV2cNotification(
+            "snmpTrapOID.0 varbind must contain an ObjectIdentifier",
+        ));
+    };
+
+    Ok((*uptime_value as i64, trap_oid_value.to_string()))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BerTlv<'a> {
+    tag: u8,
+    content: &'a [u8],
+    content_start: usize,
+    content_end: usize,
+    tlv_end: usize,
+}
+
+fn raw_v1_generic_trap(data: &[u8]) -> Result<i64, ParseError> {
+    let (version, _, pdu) = raw_message_fields(data)?;
+    if version.tag != 0x02 || decode_ber_integer_i64(version.content)? != 0 {
+        return Err(ParseError::MalformedMessage(
+            "SNMP message did not contain SNMPv1 version".to_string(),
+        ));
+    }
+    if pdu.tag != 0xa4 {
+        return Err(ParseError::MalformedMessage(
+            "SNMPv1 message did not contain a Trap-PDU".to_string(),
+        ));
+    }
+
+    let mut offset = pdu.content_start;
+    offset = read_tlv_at(data, offset)?.tlv_end;
+    offset = read_tlv_at(data, offset)?.tlv_end;
+    let generic_trap = read_tlv_at(data, offset)?;
+    if generic_trap.tag != 0x02 {
+        return Err(ParseError::MalformedMessage(
+            "SNMPv1 generic-trap was not encoded as an INTEGER".to_string(),
+        ));
+    }
+
+    decode_ber_integer_i64(generic_trap.content)
+}
+
+fn raw_v2c_request_id(data: &[u8]) -> Result<i64, ParseError> {
+    let (version, _, pdu) = raw_message_fields(data)?;
+    if version.tag != 0x02 || decode_ber_integer_i64(version.content)? != 1 {
+        return Err(ParseError::MalformedMessage(
+            "SNMP message did not contain SNMPv2c version".to_string(),
+        ));
+    }
+
+    let request_id = read_tlv_at(data, pdu.content_start)?;
+    if request_id.tag != 0x02 {
+        return Err(ParseError::MalformedMessage(
+            "SNMPv2c request-id was not encoded as an INTEGER".to_string(),
+        ));
+    }
+    validate_request_id(decode_ber_integer_i64(request_id.content)?)
+}
+
+fn patch_negative_v2c_request_id(data: &Bytes) -> Result<Option<(Bytes, i64)>, ParseError> {
+    let Ok((version, _, pdu)) = raw_message_fields(data) else {
+        return Ok(None);
+    };
+    if version.tag != 0x02
+        || decode_ber_integer_i64(version.content)? != 1
+        || pdu.tag & 0xe0 != 0xa0
+    {
+        return Ok(None);
+    }
+
+    let request_id = read_tlv_at(data, pdu.content_start)?;
+    if request_id.tag != 0x02 {
+        return Ok(None);
+    }
+    let request_id_value = validate_request_id(decode_ber_integer_i64(request_id.content)?)?;
+    if request_id_value >= 0 {
+        return Ok(None);
+    }
+
+    let mut patched = data.to_vec();
+    for byte in &mut patched[request_id.content_start..request_id.content_end] {
+        *byte = 0;
+    }
+
+    Ok(Some((Bytes::from(patched), request_id_value)))
+}
+
+/// Number of PDU fields preceding the VarBindList in an SNMPv1 Trap-PDU (RFC 1157).
+const V1_FIELDS_BEFORE_VARBINDS: usize = 5;
+/// Number of PDU fields preceding the VarBindList in an SNMPv2 PDU (RFC 3416).
+const V2C_FIELDS_BEFORE_VARBINDS: usize = 3;
+
+/// The raw value TLV of each variable binding in a message.
+struct RawVarbinds<'a> {
+    values: Vec<BerTlv<'a>>,
+}
+
+fn raw_varbind_list(data: &[u8], fields_before: usize) -> Result<RawVarbinds<'_>, ParseError> {
+    let (_, _, pdu) = raw_message_fields(data)?;
+    let mut offset = pdu.content_start;
+    for _ in 0..fields_before {
+        offset = read_tlv_at(data, offset)?.tlv_end;
+    }
+    let list = read_tlv_at(data, offset)?;
+
+    let mut values = Vec::new();
+    let mut varbind_offset = list.content_start;
+    while varbind_offset < list.content_end {
+        let varbind = read_tlv_at(data, varbind_offset)?;
+        let oid = read_tlv_at(data, varbind.content_start)?;
+        values.push(read_tlv_at(data, oid.tlv_end)?);
+        varbind_offset = varbind.tlv_end;
+    }
+
+    Ok(RawVarbinds { values })
+}
+
+/// Detects SNMPv1 and SNMPv2c messages rejected only because their community is not UTF-8, so that
+/// the failure can be reported more precisely than a generic parse error.
+fn has_non_utf8_community(data: &[u8]) -> bool {
+    let Ok((version, community, _)) = raw_message_fields(data) else {
+        return false;
+    };
+    version.tag == 0x02
+        && matches!(decode_ber_integer_i64(version.content), Ok(0 | 1))
+        && community.tag == 0x04
+        && std::str::from_utf8(community.content).is_err()
+}
+
+fn raw_message_fields(data: &[u8]) -> Result<(BerTlv<'_>, BerTlv<'_>, BerTlv<'_>), ParseError> {
+    let message = read_tlv_at(data, 0)?;
+    if message.tag != 0x30 {
+        return Err(ParseError::MalformedMessage(
+            "SNMP message must start with a sequence".to_string(),
+        ));
+    }
+
+    let mut offset = message.content_start;
+    let version = read_tlv_at(data, offset)?;
+    offset = version.tlv_end;
+    let community = read_tlv_at(data, offset)?;
+    offset = community.tlv_end;
+    let pdu = read_tlv_at(data, offset)?;
+
+    Ok((version, community, pdu))
+}
+
+fn read_tlv_at(data: &[u8], offset: usize) -> Result<BerTlv<'_>, ParseError> {
+    let Some(tag) = data.get(offset).copied() else {
+        return Err(ParseError::MalformedMessage(
+            "truncated BER identifier".to_string(),
+        ));
+    };
+
+    let mut cursor = offset + 1;
+    if tag & 0x1f == 0x1f {
+        loop {
+            let Some(identifier_byte) = data.get(cursor).copied() else {
+                return Err(ParseError::MalformedMessage(
+                    "truncated high-tag-number BER identifier".to_string(),
+                ));
+            };
+            cursor += 1;
+            if identifier_byte & 0x80 == 0 {
+                break;
+            }
+        }
+    }
+
+    let (length, content_start) = read_ber_length(data, cursor)?;
+    let content_end = content_start.checked_add(length).ok_or_else(|| {
+        ParseError::MalformedMessage("BER length overflowed message size".to_string())
+    })?;
+    if content_end > data.len() {
+        return Err(ParseError::MalformedMessage(
+            "BER value exceeds message length".to_string(),
+        ));
+    }
+
+    Ok(BerTlv {
+        tag,
+        content: &data[content_start..content_end],
+        content_start,
+        content_end,
+        tlv_end: content_end,
+    })
+}
+
+fn read_ber_length(data: &[u8], offset: usize) -> Result<(usize, usize), ParseError> {
+    let Some(first) = data.get(offset).copied() else {
+        return Err(ParseError::MalformedMessage(
+            "truncated BER length".to_string(),
+        ));
+    };
+
+    if first & 0x80 == 0 {
+        return Ok((first as usize, offset + 1));
+    }
+
+    let byte_count = (first & 0x7f) as usize;
+    if byte_count == 0 || byte_count > std::mem::size_of::<usize>() {
+        return Err(ParseError::MalformedMessage(
+            "unsupported BER length encoding".to_string(),
+        ));
+    }
+
+    let length_start = offset + 1;
+    let length_end = length_start
+        .checked_add(byte_count)
+        .ok_or_else(|| ParseError::MalformedMessage("BER length overflowed".to_string()))?;
+    if length_end > data.len() {
+        return Err(ParseError::MalformedMessage(
+            "truncated BER length".to_string(),
+        ));
+    }
+
+    let mut length = 0usize;
+    for byte in &data[length_start..length_end] {
+        length = (length << 8) | *byte as usize;
+    }
+
+    Ok((length, length_end))
+}
+
+fn decode_ber_integer_i64(content: &[u8]) -> Result<i64, ParseError> {
+    if content.is_empty() || content.len() > std::mem::size_of::<i64>() {
+        return Err(ParseError::MalformedMessage(
+            "BER INTEGER cannot be decoded as i64".to_string(),
+        ));
+    }
+
+    let fill = if content[0] & 0x80 == 0 { 0x00 } else { 0xff };
+    let mut bytes = [fill; std::mem::size_of::<i64>()];
+    let start = bytes.len() - content.len();
+    bytes[start..].copy_from_slice(content);
+
+    Ok(i64::from_be_bytes(bytes))
+}
+
+fn validate_request_id(value: i64) -> Result<i64, ParseError> {
+    if (i32::MIN as i64..=i32::MAX as i64).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ParseError::InvalidRequestId(
+            "request-id must fit the signed 32-bit RFC 3416 range",
+        ))
+    }
+}
+
+fn format_varbinds(
+    variables: &[SnmpVariable<'_>],
+    raw_varbinds: &RawVarbinds<'_>,
+) -> Vec<serde_json::Value> {
+    variables
+        .iter()
+        .enumerate()
+        .map(|(index, variable)| {
+            let raw = raw_varbinds.values.get(index);
+            // snmp-parser decodes zero-length OCTET STRINGs as empty values.
+            let empty_string = VarBindValue::Value(ObjectSyntax::String(&[]));
+            let value = match (&variable.val, raw) {
+                (VarBindValue::Value(ObjectSyntax::Empty), Some(raw)) if raw.tag == 0x04 => {
+                    &empty_string
+                }
+                (value, _) => value,
+            };
+            let formatted = match (value, raw) {
+                // snmp-parser decodes any tag number 5 as NULL regardless of its class, so
+                // recover values such as `[APPLICATION 5]` NsapAddress from the raw encoding.
+                (VarBindValue::Unspecified, Some(raw)) if raw.tag != 0x05 => {
+                    format_misparsed_null(raw)
+                }
+                (value, _) => format_varbind_value(value),
+            };
+            let oid = variable.oid.to_string();
+            let mut varbind = serde_json::Map::from_iter([
+                ("oid".to_string(), json!(oid)),
+                ("type".to_string(), json!(formatted.value_type)),
+                ("value".to_string(), json!(formatted.value)),
+            ]);
+
+            if let Some(value_bytes_hex) = formatted.value_bytes_hex {
+                varbind.insert("value_bytes_hex".to_string(), json!(value_bytes_hex));
+            }
+
+            serde_json::Value::Object(varbind)
+        })
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FormattedVarbindValue {
+    value_type: &'static str,
+    value: String,
+    value_bytes_hex: Option<String>,
+}
+
+fn format_varbind_value(value: &VarBindValue<'_>) -> FormattedVarbindValue {
+    match value {
+        VarBindValue::Value(value) => format_object_value(value),
+        VarBindValue::Unspecified => formatted_value("unspecified", "unspecified"),
+        VarBindValue::NoSuchObject => formatted_value("no_such_object", "noSuchObject"),
+        VarBindValue::NoSuchInstance => formatted_value("no_such_instance", "noSuchInstance"),
+        VarBindValue::EndOfMibView => formatted_value("end_of_mib_view", "endOfMibView"),
+    }
+}
+
+fn format_object_value(value: &ObjectSyntax<'_>) -> FormattedVarbindValue {
+    match value {
+        ObjectSyntax::Number(value) => formatted_value("integer", value.to_string()),
+        ObjectSyntax::String(value) => {
+            let value_bytes_hex = bytes_to_hex(value);
+            FormattedVarbindValue {
+                value_type: "octet_string",
+                value: printable_utf8(value)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value_bytes_hex.clone()),
+                value_bytes_hex: Some(value_bytes_hex),
+            }
+        }
+        ObjectSyntax::Object(value) => formatted_value("object_identifier", value.to_string()),
+        ObjectSyntax::BitString(value) => formatted_bytes_value(
+            "bit_string",
+            format!(
+                "unused_bits={},bytes={}",
+                value.unused_bits,
+                bytes_to_hex(value.data.as_ref())
+            ),
+            value.data.as_ref(),
+        ),
+        ObjectSyntax::IpAddress(value) => {
+            formatted_value("ip_address", format_network_address(*value))
+        }
+        ObjectSyntax::Counter32(value) => formatted_value("counter32", value.to_string()),
+        ObjectSyntax::Gauge32(value) => formatted_value("gauge32", value.to_string()),
+        ObjectSyntax::TimeTicks(value) => formatted_value("timeticks", value.to_string()),
+        ObjectSyntax::Opaque(value) => formatted_bytes_value("opaque", bytes_to_hex(value), value),
+        ObjectSyntax::Counter64(value) => formatted_value("counter64", value.to_string()),
+        ObjectSyntax::UInteger32(value) => formatted_value("unsigned32", value.to_string()),
+        ObjectSyntax::NsapAddress(value) => {
+            formatted_bytes_value("nsap_address", bytes_to_hex(value), value)
+        }
+        ObjectSyntax::Empty => formatted_value("empty", "empty"),
+        ObjectSyntax::UnknownSimple(value) => formatted_bytes_value(
+            "unknown_simple",
+            format_unknown_value(
+                value.class(),
+                value.header.constructed(),
+                value.tag().0,
+                value.as_bytes(),
+            ),
+            value.as_bytes(),
+        ),
+        ObjectSyntax::UnknownApplication(value) => formatted_bytes_value(
+            "unknown_application",
+            format_unknown_value(
+                value.class(),
+                value.header.constructed(),
+                value.tag().0,
+                value.as_bytes(),
+            ),
+            value.as_bytes(),
+        ),
+    }
+}
+
+fn format_misparsed_null(raw: &BerTlv<'_>) -> FormattedVarbindValue {
+    if raw.tag == 0x45 {
+        return formatted_bytes_value("nsap_address", bytes_to_hex(raw.content), raw.content);
+    }
+
+    let class = match raw.tag >> 6 {
+        0 => "UNIVERSAL",
+        1 => "APPLICATION",
+        2 => "CONTEXT-SPECIFIC",
+        _ => "PRIVATE",
+    };
+    formatted_bytes_value(
+        "unknown_simple",
+        format_unknown_value(
+            class,
+            raw.tag & 0x20 != 0,
+            u32::from(raw.tag & 0x1f),
+            raw.content,
+        ),
+        raw.content,
+    )
+}
+
+fn formatted_value(value_type: &'static str, value: impl Into<String>) -> FormattedVarbindValue {
+    FormattedVarbindValue {
+        value_type,
+        value: value.into(),
+        value_bytes_hex: None,
+    }
+}
+
+fn formatted_bytes_value(
+    value_type: &'static str,
+    value: impl Into<String>,
+    bytes: &[u8],
+) -> FormattedVarbindValue {
+    FormattedVarbindValue {
+        value_type,
+        value: value.into(),
+        value_bytes_hex: Some(bytes_to_hex(bytes)),
+    }
+}
+
+fn printable_utf8(bytes: &[u8]) -> Option<&str> {
+    let value = std::str::from_utf8(bytes).ok()?;
+    value
+        .chars()
+        .all(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .then_some(value)
+}
+
+fn format_unknown_value(
+    class: impl std::fmt::Display,
+    constructed: bool,
+    tag: u32,
+    bytes: &[u8],
+) -> String {
+    format!(
+        "class={},constructed={},tag={},bytes={}",
+        class,
+        constructed,
+        tag,
+        bytes_to_hex(bytes)
+    )
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn format_network_address(value: NetworkAddress) -> String {
+    match value {
+        NetworkAddress::IPv4(ip) => ip.to_string(),
+    }
+}
+
+/// Translates SNMPv1 trap identification into an SNMPv2 `snmpTrapOID.0` value as described in
+/// RFC 3584 section 3.1.
+fn v1_trap_oid(enterprise_oid: &str, generic_trap: u8, specific_trap: u32) -> String {
+    if generic_trap == 6 {
+        format!("{enterprise_oid}.0.{specific_trap}")
+    } else {
+        format!("1.3.6.1.6.3.1.1.5.{}", generic_trap + 1)
+    }
+}
+
+const fn trap_type_name(value: u8) -> &'static str {
+    match value {
+        0 => "coldStart",
+        1 => "warmStart",
+        2 => "linkDown",
+        3 => "linkUp",
+        4 => "authenticationFailure",
+        5 => "egpNeighborLoss",
+        6 => "enterpriseSpecific",
+        _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+fn encode_sequence(content: &[u8]) -> Vec<u8> {
+    encode_tlv(0x30, content)
+}
+
+#[cfg(test)]
+fn encode_integer_u64(value: u64) -> Vec<u8> {
+    encode_tlv(0x02, &encode_unsigned_integer_content(value))
+}
+
+#[cfg(test)]
+fn encode_integer_i64(value: i64) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let mut start = 0;
+    while start + 1 < bytes.len() {
+        let current = bytes[start];
+        let next = bytes[start + 1];
+        if (current == 0x00 && next & 0x80 == 0) || (current == 0xff && next & 0x80 != 0) {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    encode_tlv(0x02, &bytes[start..])
+}
+
+#[cfg(test)]
+fn encode_unsigned_integer_content(value: u64) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let first_non_zero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    let mut content = bytes[first_non_zero..].to_vec();
+    if content[0] & 0x80 != 0 {
+        content.insert(0, 0);
+    }
+    content
+}
+
+#[cfg(test)]
+fn encode_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(1 + 5 + content.len());
+    value.push(tag);
+    encode_length(content.len(), &mut value);
+    value.extend(content);
+    value
+}
+
+#[cfg(test)]
+fn encode_length(length: usize, output: &mut Vec<u8>) {
+    if length < 128 {
+        output.push(length as u8);
+        return;
+    }
+
+    let bytes = length.to_be_bytes();
+    let first_non_zero = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    let significant = &bytes[first_non_zero..];
+    output.push(0x80 | significant.len() as u8);
+    output.extend(significant);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snmp_parser::snmp::PduType;
+    use std::net::{IpAddr, Ipv4Addr};
+    use vector_lib::{event::Value, lookup::path};
+
+    fn source_addr() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1162)
+    }
+
+    fn oid(arcs: &[u64]) -> Vec<u8> {
+        assert!(arcs.len() >= 2);
+        let mut encoded = vec![(arcs[0] * 40 + arcs[1]) as u8];
+        for mut arc in arcs.iter().copied().skip(2) {
+            let mut stack = vec![(arc & 0x7f) as u8];
+            arc >>= 7;
+            while arc > 0 {
+                stack.push(((arc & 0x7f) as u8) | 0x80);
+                arc >>= 7;
+            }
+            encoded.extend(stack.into_iter().rev());
+        }
+        encoded
+    }
+
+    fn oid_value(arcs: &[u64]) -> Vec<u8> {
+        encode_tlv(0x06, &oid(arcs))
+    }
+
+    fn timeticks(value: u64) -> Vec<u8> {
+        encode_tlv(0x43, &encode_unsigned_integer_content(value))
+    }
+
+    fn integer(value: u64) -> Vec<u8> {
+        encode_integer_u64(value)
+    }
+
+    fn signed_integer(value: i64) -> Vec<u8> {
+        encode_integer_i64(value)
+    }
+
+    fn octet_string(value: &[u8]) -> Vec<u8> {
+        encode_tlv(0x04, value)
+    }
+
+    fn null() -> Vec<u8> {
+        encode_tlv(0x05, &[])
+    }
+
+    fn opaque(value: &[u8]) -> Vec<u8> {
+        encode_tlv(0x44, value)
+    }
+
+    fn varbind(oid_arcs: &[u64], value: Vec<u8>) -> Vec<u8> {
+        let mut content = Vec::new();
+        content.extend(oid_value(oid_arcs));
+        content.extend(value);
+        encode_sequence(&content)
+    }
+
+    fn v2c_message(pdu_type: PduType, request_id: u32, varbinds: Vec<Vec<u8>>) -> Bytes {
+        v2c_message_with_request_id(
+            pdu_type,
+            encode_integer_u64(request_id as u64),
+            b"public",
+            varbinds,
+        )
+    }
+
+    fn v2c_message_with_request_id(
+        pdu_type: PduType,
+        request_id: Vec<u8>,
+        community: &[u8],
+        varbinds: Vec<Vec<u8>>,
+    ) -> Bytes {
+        let pdu = v2c_pdu(pdu_type, request_id, varbinds);
+
+        let mut message = Vec::new();
+        message.extend(encode_integer_u64(1));
+        message.extend(encode_tlv(0x04, community));
+        message.extend(pdu);
+
+        Bytes::from(encode_sequence(&message))
+    }
+
+    fn v2c_pdu(pdu_type: PduType, request_id: Vec<u8>, varbinds: Vec<Vec<u8>>) -> Vec<u8> {
+        let mut varbind_list = Vec::new();
+        for varbind in varbinds {
+            varbind_list.extend(varbind);
+        }
+
+        let mut pdu = Vec::new();
+        pdu.extend(request_id);
+        pdu.extend(encode_integer_u64(0));
+        pdu.extend(encode_integer_u64(0));
+        pdu.extend(encode_sequence(&varbind_list));
+
+        encode_tlv(0xa0 | pdu_type.0 as u8, &pdu)
+    }
+
+    fn v2c_notification(pdu_type: PduType) -> Bytes {
+        v2c_message(pdu_type, 42, notification_varbinds())
+    }
+
+    fn notification_varbinds() -> Vec<Vec<u8>> {
+        let mut varbinds = required_notification_varbinds();
+        varbinds.push(varbind(&[1, 3, 6, 1, 4, 1, 8072, 2, 4, 1, 0], integer(7)));
+        varbinds
+    }
+
+    fn required_notification_varbinds() -> Vec<Vec<u8>> {
+        vec![
+            varbind(&[1, 3, 6, 1, 2, 1, 1, 3, 0], timeticks(123_456)),
+            varbind(
+                &[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0],
+                oid_value(&[1, 3, 6, 1, 4, 1, 8072, 2, 3, 0, 1]),
+            ),
+        ]
+    }
+
+    fn v1_trap() -> Bytes {
+        v1_trap_with_generic_trap(integer(6))
+    }
+
+    fn v1_trap_with_generic_trap(generic_trap: Vec<u8>) -> Bytes {
+        let mut pdu = Vec::new();
+        pdu.extend(oid_value(&[1, 3, 6, 1, 4, 1, 8072, 2, 3, 0, 1]));
+        pdu.extend(encode_tlv(0x40, &[192, 168, 1, 100]));
+        pdu.extend(generic_trap);
+        pdu.extend(encode_integer_u64(1));
+        pdu.extend(timeticks(123_456));
+        pdu.extend(encode_sequence(&[]));
+
+        let mut message = Vec::new();
+        message.extend(encode_integer_u64(0));
+        message.extend(encode_tlv(0x04, b"public"));
+        message.extend(encode_tlv(0xa4, &pdu));
+
+        Bytes::from(encode_sequence(&message))
+    }
+
+    fn v3_trap() -> Bytes {
+        let mut header = Vec::new();
+        header.extend(integer(1));
+        header.extend(integer(MAX_SNMP_MESSAGE_SIZE as u64));
+        header.extend(octet_string(&[0]));
+        header.extend(integer(1));
+
+        let mut scoped_pdu = Vec::new();
+        scoped_pdu.extend(octet_string(&[]));
+        scoped_pdu.extend(octet_string(&[]));
+        scoped_pdu.extend(v2c_pdu(
+            PduType::TrapV2,
+            integer(42),
+            vec![
+                varbind(&[1, 3, 6, 1, 2, 1, 1, 3, 0], timeticks(123_456)),
+                varbind(
+                    &[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0],
+                    oid_value(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]),
+                ),
+            ],
+        ));
+
+        let mut message = Vec::new();
+        message.extend(integer(3));
+        message.extend(encode_sequence(&header));
+        message.extend(octet_string(&[]));
+        message.extend(encode_sequence(&scoped_pdu));
+
+        Bytes::from(encode_sequence(&message))
+    }
+
+    #[test]
+    fn test_format_object_value() {
+        assert_eq!(
+            format_object_value(&ObjectSyntax::String(b"test")),
+            FormattedVarbindValue {
+                value_type: "octet_string",
+                value: "test".to_string(),
+                value_bytes_hex: Some("74657374".to_string()),
+            }
+        );
+        assert_eq!(
+            format_object_value(&ObjectSyntax::Counter32(100)),
+            formatted_value("counter32", "100")
+        );
+        assert_eq!(
+            format_object_value(&ObjectSyntax::Gauge32(200)),
+            formatted_value("gauge32", "200")
+        );
+        assert_eq!(
+            format_object_value(&ObjectSyntax::TimeTicks(300)),
+            formatted_value("timeticks", "300")
+        );
+        assert_eq!(
+            format_object_value(&ObjectSyntax::Counter64(400)),
+            formatted_value("counter64", "400")
+        );
+        assert_eq!(
+            format_object_value(&ObjectSyntax::UInteger32(500)),
+            formatted_value("unsigned32", "500")
+        );
+        assert_eq!(
+            format_object_value(&ObjectSyntax::Empty),
+            formatted_value("empty", "empty")
+        );
+        assert_eq!(
+            format_object_value(&ObjectSyntax::IpAddress(NetworkAddress::IPv4(
+                Ipv4Addr::new(192, 168, 1, 1)
+            ))),
+            formatted_value("ip_address", "192.168.1.1")
+        );
+    }
+
+    #[test]
+    fn test_parse_v1_trap() {
+        let parsed = parse_snmp_trap(&v1_trap(), source_addr()).unwrap();
+
+        let log = parsed.events[0].as_log();
+        assert_eq!(log["snmp_version"], Value::from("1"));
+        assert_eq!(log["pdu_type"], Value::from("trap_v1"));
+        assert_eq!(
+            log["enterprise_oid"],
+            Value::from("1.3.6.1.4.1.8072.2.3.0.1")
+        );
+        assert_eq!(log["agent_address"], Value::from("192.168.1.100"));
+        assert_eq!(log["generic_trap"], Value::from(6));
+        assert_eq!(log["generic_trap_name"], Value::from("enterpriseSpecific"));
+        assert_eq!(log["trap_oid"], Value::from("1.3.6.1.4.1.8072.2.3.0.1.0.1"));
+        assert_eq!(log["uptime"], Value::from(123_456));
+    }
+
+    #[test]
+    fn test_parse_v1_generic_trap_translates_trap_oid() {
+        let parsed =
+            parse_snmp_trap(&v1_trap_with_generic_trap(integer(2)), source_addr()).unwrap();
+
+        let log = parsed.events[0].as_log();
+        assert_eq!(log["generic_trap_name"], Value::from("linkDown"));
+        assert_eq!(log["trap_oid"], Value::from("1.3.6.1.6.3.1.1.5.3"));
+    }
+
+    #[test]
+    fn test_parse_v1_trap_rejects_unknown_generic_trap() {
+        let result = parse_snmp_trap(&v1_trap_with_generic_trap(integer(7)), source_addr());
+        assert!(matches!(result, Err(ParseError::InvalidV1Trap(_))));
+    }
+
+    #[test]
+    fn test_parse_v1_trap_rejects_wrapped_generic_trap() {
+        let result = parse_snmp_trap(&v1_trap_with_generic_trap(integer(256)), source_addr());
+        assert!(matches!(result, Err(ParseError::InvalidV1Trap(_))));
+    }
+
+    #[test]
+    fn test_parse_v2c_trap() {
+        let parsed = parse_snmp_trap(&v2c_notification(PduType::TrapV2), source_addr()).unwrap();
+
+        let log = parsed.events[0].as_log();
+        assert_eq!(log["snmp_version"], Value::from("2c"));
+        assert_eq!(log["pdu_type"], Value::from("trap_v2"));
+        assert_eq!(log["request_id"], Value::from(42));
+        assert_eq!(log["uptime"], Value::from(123_456));
+        assert_eq!(log["trap_oid"], Value::from("1.3.6.1.4.1.8072.2.3.0.1"));
+
+        let varbinds = log["varbinds"].as_array().unwrap();
+        assert_eq!(varbinds.len(), 3);
+        assert_eq!(
+            varbinds[0].get(path!("type")).unwrap(),
+            &Value::from("timeticks")
+        );
+        assert_eq!(
+            varbinds[2].get(path!("type")).unwrap(),
+            &Value::from("integer")
+        );
+    }
+
+    #[test]
+    fn test_parse_v2c_trap_preserves_negative_request_id() {
+        let parsed = parse_snmp_trap(
+            &v2c_message_with_request_id(
+                PduType::TrapV2,
+                signed_integer(-1),
+                b"public",
+                notification_varbinds(),
+            ),
+            source_addr(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.events[0].as_log()["request_id"], Value::from(-1));
+    }
+
+    #[test]
+    fn test_parse_v2c_trap_rejects_positive_request_id_outside_integer32() {
+        let result = parse_snmp_trap(
+            &v2c_message_with_request_id(
+                PduType::TrapV2,
+                encode_tlv(0x02, &[0x00, 0x80, 0x00, 0x00, 0x00]),
+                b"public",
+                notification_varbinds(),
+            ),
+            source_addr(),
+        );
+        assert!(matches!(result, Err(ParseError::InvalidRequestId(_))));
+    }
+
+    #[test]
+    fn test_parse_v2c_exception_varbind_values() {
+        let parsed = parse_snmp_trap(
+            &v2c_message(
+                PduType::TrapV2,
+                42,
+                vec![
+                    varbind(&[1, 3, 6, 1, 2, 1, 1, 3, 0], timeticks(123_456)),
+                    varbind(
+                        &[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0],
+                        oid_value(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]),
+                    ),
+                    varbind(&[1, 3, 6, 1, 2, 1, 1, 99, 0], encode_tlv(0x80, &[])),
+                    varbind(&[1, 3, 6, 1, 2, 1, 1, 100, 0], encode_tlv(0x81, &[])),
+                    varbind(&[1, 3, 6, 1, 2, 1, 1, 101, 0], encode_tlv(0x82, &[])),
+                ],
+            ),
+            source_addr(),
+        )
+        .unwrap();
+
+        let varbinds = parsed.events[0].as_log()["varbinds"].as_array().unwrap();
+        assert_eq!(
+            varbinds[2].get(path!("type")).unwrap(),
+            &Value::from("no_such_object")
+        );
+        assert_eq!(
+            varbinds[3].get(path!("type")).unwrap(),
+            &Value::from("no_such_instance")
+        );
+        assert_eq!(
+            varbinds[4].get(path!("type")).unwrap(),
+            &Value::from("end_of_mib_view")
+        );
+    }
+
+    #[test]
+    fn test_parse_v2c_binary_values_include_hex() {
+        let parsed = parse_snmp_trap(
+            &v2c_message(
+                PduType::TrapV2,
+                42,
+                vec![
+                    varbind(&[1, 3, 6, 1, 2, 1, 1, 3, 0], timeticks(123_456)),
+                    varbind(
+                        &[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0],
+                        oid_value(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]),
+                    ),
+                    varbind(
+                        &[1, 3, 6, 1, 2, 1, 2, 2, 1, 6, 1],
+                        octet_string(&[0, 0x11, 0x22, 0xaa, 0xbb, 0xcc]),
+                    ),
+                    varbind(&[1, 3, 6, 1, 2, 1, 1, 102, 0], opaque(&[0xde, 0xad])),
+                ],
+            ),
+            source_addr(),
+        )
+        .unwrap();
+
+        let varbinds = parsed.events[0].as_log()["varbinds"].as_array().unwrap();
+        assert_eq!(
+            varbinds[2].get(path!("value")).unwrap(),
+            &Value::from("001122aabbcc")
+        );
+        assert_eq!(
+            varbinds[2].get(path!("value_bytes_hex")).unwrap(),
+            &Value::from("001122aabbcc")
+        );
+        assert_eq!(
+            varbinds[3].get(path!("value")).unwrap(),
+            &Value::from("dead")
+        );
+        assert_eq!(
+            varbinds[3].get(path!("value_bytes_hex")).unwrap(),
+            &Value::from("dead")
+        );
+    }
+
+    #[test]
+    fn test_parse_v2c_requires_notification_oids() {
+        let result = parse_snmp_trap(
+            &v2c_message(
+                PduType::TrapV2,
+                42,
+                vec![varbind(&[1, 3, 6, 1, 4, 1, 8072, 2, 4, 1, 0], integer(7))],
+            ),
+            source_addr(),
+        );
+        assert!(matches!(
+            result,
+            Err(ParseError::InvalidV2cNotification(
+                "first varbind must be sysUpTime.0"
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_parse_v2c_rejects_wrong_notification_oid_order() {
+        let result = parse_snmp_trap(
+            &v2c_message(
+                PduType::TrapV2,
+                42,
+                vec![
+                    varbind(
+                        &[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0],
+                        oid_value(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]),
+                    ),
+                    varbind(&[1, 3, 6, 1, 2, 1, 1, 3, 0], timeticks(123_456)),
+                ],
+            ),
+            source_addr(),
+        );
+        assert!(matches!(
+            result,
+            Err(ParseError::InvalidV2cNotification(
+                "first varbind must be sysUpTime.0"
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_parse_v2c_rejects_wrong_notification_value_types() {
+        let result = parse_snmp_trap(
+            &v2c_message(
+                PduType::TrapV2,
+                42,
+                vec![
+                    varbind(&[1, 3, 6, 1, 2, 1, 1, 3, 0], integer(123_456)),
+                    varbind(
+                        &[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0],
+                        oid_value(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]),
+                    ),
+                ],
+            ),
+            source_addr(),
+        );
+        assert!(matches!(
+            result,
+            Err(ParseError::InvalidV2cNotification(
+                "sysUpTime.0 varbind must contain TimeTicks"
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_parse_v2c_get_request_rejected() {
+        let result = parse_snmp_trap(
+            &v2c_message(
+                PduType::GetRequest,
+                42,
+                vec![varbind(&[1, 3, 6, 1, 2, 1, 1, 1, 0], null())],
+            ),
+            source_addr(),
+        );
+        assert!(matches!(
+            result,
+            Err(ParseError::InvalidPduType(PduType::GetRequest))
+        ));
+    }
+
+    #[test]
+    fn test_parse_trailing_data_rejected() {
+        let mut data = v2c_notification(PduType::TrapV2).to_vec();
+        data.push(0);
+        let result = parse_snmp_trap(&Bytes::from(data), source_addr());
+        assert!(matches!(result, Err(ParseError::TrailingData(1))));
+    }
+
+    #[test]
+    fn test_parse_v3_rejected() {
+        let error = parse_snmp_trap(&v3_trap(), source_addr()).unwrap_err();
+        assert!(matches!(error, ParseError::UnsupportedVersion(_)));
+        assert_eq!(error.error_code(), "unsupported_version");
+    }
+
+    #[test]
+    fn test_parse_invalid_data() {
+        let data = Bytes::from("invalid data");
+        let result = parse_snmp_trap(&data, source_addr());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_empty_data() {
+        let data = Bytes::from("");
+        let result = parse_snmp_trap(&data, source_addr());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_reports_malformed_pdus_with_valid_communities_as_malformed() {
+        let mut message = Vec::new();
+        message.extend(encode_integer_u64(1));
+        message.extend(encode_tlv(0x04, b"public"));
+        let mut pdu = encode_integer_u64(42);
+        pdu.push(0xff);
+        message.extend(encode_tlv(0xa7, &pdu));
+
+        let result = parse_snmp_trap(&Bytes::from(encode_sequence(&message)), source_addr());
+        assert!(
+            matches!(result, Err(ParseError::MalformedMessage(_))),
+            "expected a malformed-message error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_reports_non_utf8_community() {
+        let data = v2c_message_with_request_id(
+            PduType::TrapV2,
+            encode_integer_u64(42),
+            &[0xff, 0xfe],
+            notification_varbinds(),
+        );
+
+        let result = parse_snmp_trap(&data, source_addr());
+        assert!(matches!(result, Err(ParseError::InvalidCommunity)));
+    }
+
+    #[test]
+    fn test_class_tagged_null_lookalikes_keep_their_values() {
+        let mut varbinds = required_notification_varbinds();
+        varbinds.push(varbind(
+            &[1, 3, 6, 1, 4, 1, 1, 1],
+            encode_tlv(0x45, &[0x01, 0x02]),
+        ));
+        varbinds.push(varbind(
+            &[1, 3, 6, 1, 4, 1, 1, 2],
+            encode_tlv(0xc5, &[0xab]),
+        ));
+        varbinds.push(varbind(&[1, 3, 6, 1, 4, 1, 1, 3], null()));
+        varbinds.push(varbind(
+            &[1, 3, 6, 1, 4, 1, 1, 4],
+            encode_tlv(0x25, &[0x01]),
+        ));
+        varbinds.push(varbind(
+            &[1, 3, 6, 1, 4, 1, 1, 5],
+            encode_tlv(0x65, &[0x02]),
+        ));
+
+        let parsed =
+            parse_snmp_trap(&v2c_message(PduType::TrapV2, 1, varbinds), source_addr()).unwrap();
+
+        let varbinds = parsed.events[0].as_log()["varbinds"].as_array().unwrap();
+        let field = |index: usize, name: &str| varbinds[index].get(path!(name)).cloned();
+        assert_eq!(field(2, "type"), Some(Value::from("nsap_address")));
+        assert_eq!(field(2, "value"), Some(Value::from("0102")));
+        assert_eq!(field(3, "type"), Some(Value::from("unknown_simple")));
+        assert_eq!(
+            field(3, "value"),
+            Some(Value::from(
+                "class=PRIVATE,constructed=false,tag=5,bytes=ab"
+            ))
+        );
+        assert_eq!(field(4, "type"), Some(Value::from("unspecified")));
+        assert_eq!(
+            field(5, "value"),
+            Some(Value::from(
+                "class=UNIVERSAL,constructed=true,tag=5,bytes=01"
+            ))
+        );
+        assert_eq!(
+            field(6, "value"),
+            Some(Value::from(
+                "class=APPLICATION,constructed=true,tag=5,bytes=02"
+            ))
+        );
+    }
+
+    #[test]
+    fn test_ber_integer_encoding_is_minimal_twos_complement() {
+        for (value, expected) in [
+            (0, vec![0x02, 0x01, 0x00]),
+            (127, vec![0x02, 0x01, 0x7f]),
+            (128, vec![0x02, 0x02, 0x00, 0x80]),
+            (256, vec![0x02, 0x02, 0x01, 0x00]),
+            (-1, vec![0x02, 0x01, 0xff]),
+            (-128, vec![0x02, 0x01, 0x80]),
+            (-129, vec![0x02, 0x02, 0xff, 0x7f]),
+            (
+                i64::from(i32::MIN),
+                vec![0x02, 0x04, 0x80, 0x00, 0x00, 0x00],
+            ),
+            (
+                i64::from(i32::MAX),
+                vec![0x02, 0x04, 0x7f, 0xff, 0xff, 0xff],
+            ),
+        ] {
+            assert_eq!(encode_integer_i64(value), expected, "encoding {value}");
+            assert_eq!(decode_ber_integer_i64(&expected[2..]).unwrap(), value);
+        }
+
+        for (value, expected) in [
+            (0, vec![0x02, 0x01, 0x00]),
+            (1, vec![0x02, 0x01, 0x01]),
+            (128, vec![0x02, 0x02, 0x00, 0x80]),
+            (
+                u64::MAX,
+                vec![
+                    0x02, 0x09, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                ],
+            ),
+        ] {
+            assert_eq!(encode_integer_u64(value), expected, "encoding {value}");
+        }
+    }
+
+    #[test]
+    fn test_ber_integer_decoding_limits() {
+        assert_eq!(
+            decode_ber_integer_i64(&[0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]).unwrap(),
+            i64::MAX
+        );
+        assert!(decode_ber_integer_i64(&[]).is_err());
+        assert!(decode_ber_integer_i64(&[0x01; 9]).is_err());
+    }
+
+    #[test]
+    fn test_ber_length_encoding() {
+        for (length, expected) in [
+            (0, vec![0x00]),
+            (127, vec![0x7f]),
+            (128, vec![0x81, 0x80]),
+            (255, vec![0x81, 0xff]),
+            (256, vec![0x82, 0x01, 0x00]),
+            (65_535, vec![0x82, 0xff, 0xff]),
+            (65_536, vec![0x83, 0x01, 0x00, 0x00]),
+        ] {
+            let mut encoded = Vec::new();
+            encode_length(length, &mut encoded);
+            assert_eq!(encoded, expected, "encoding length {length}");
+            assert_eq!(
+                read_ber_length(&encoded, 0).unwrap(),
+                (length, expected.len())
+            );
+        }
+    }
+
+    #[test]
+    fn test_ber_tlv_decoding_rejects_invalid_lengths() {
+        // Indefinite lengths are not allowed in SNMP's BER subset.
+        assert!(read_tlv_at(&[0x04, 0x80, 0x00, 0x00], 0).is_err());
+        // Long-form lengths longer than a usize.
+        assert!(read_ber_length(&[0x89, 1, 1, 1, 1, 1, 1, 1, 1, 1], 0).is_err());
+        // Truncated long-form length and truncated content.
+        assert!(read_ber_length(&[0x82, 0x01], 0).is_err());
+        assert!(read_tlv_at(&[0x04, 0x03, 0x61, 0x62], 0).is_err());
+        // A value that ends exactly at the end of the data is valid.
+        let tlv = read_tlv_at(&[0x04, 0x02, 0x61, 0x62], 0).unwrap();
+        assert_eq!(tlv.content, b"ab");
+        assert_eq!(tlv.tlv_end, 4);
+    }
+
+    #[test]
+    fn test_generic_trap_names_and_oids() {
+        for (generic_trap, name, oid) in [
+            (0, "coldStart", "1.3.6.1.6.3.1.1.5.1"),
+            (1, "warmStart", "1.3.6.1.6.3.1.1.5.2"),
+            (2, "linkDown", "1.3.6.1.6.3.1.1.5.3"),
+            (3, "linkUp", "1.3.6.1.6.3.1.1.5.4"),
+            (4, "authenticationFailure", "1.3.6.1.6.3.1.1.5.5"),
+            (5, "egpNeighborLoss", "1.3.6.1.6.3.1.1.5.6"),
+            (6, "enterpriseSpecific", "1.3.6.1.4.1.9.0.17"),
+        ] {
+            assert_eq!(trap_type_name(generic_trap), name);
+            assert_eq!(v1_trap_oid("1.3.6.1.4.1.9", generic_trap, 17), oid);
+        }
+    }
+
+    #[test]
+    fn test_empty_octet_strings_are_not_reported_as_null() {
+        let mut varbinds = required_notification_varbinds();
+        varbinds.push(varbind(&[1, 3, 6, 1, 4, 1, 1, 1], octet_string(&[])));
+        varbinds.push(varbind(&[1, 3, 6, 1, 4, 1, 1, 2], null()));
+
+        let parsed =
+            parse_snmp_trap(&v2c_message(PduType::TrapV2, 1, varbinds), source_addr()).unwrap();
+
+        let varbinds = parsed.events[0].as_log()["varbinds"].as_array().unwrap();
+        let field = |index: usize, name: &str| varbinds[index].get(path!(name)).cloned();
+        assert_eq!(field(2, "type"), Some(Value::from("octet_string")));
+        assert_eq!(field(2, "value"), Some(Value::from("")));
+        assert_eq!(field(3, "type"), Some(Value::from("unspecified")));
+    }
+
+    mod robustness {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        fn valid_messages() -> Vec<Bytes> {
+            vec![
+                v1_trap(),
+                v2c_notification(PduType::TrapV2),
+                v2c_message_with_request_id(
+                    PduType::TrapV2,
+                    signed_integer(-5),
+                    b"public",
+                    notification_varbinds(),
+                ),
+            ]
+        }
+
+        fn assert_well_formed(result: Result<ParsedSnmpNotification, ParseError>) {
+            if let Ok(parsed) = result {
+                assert_eq!(parsed.events.len(), 1);
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn arbitrary_bytes_never_panic(data in proptest::collection::vec(any::<u8>(), 0..512)) {
+                assert_well_formed(parse_snmp_trap(
+                    &Bytes::from(data),
+                    source_addr(),
+                ));
+            }
+
+            #[test]
+            fn corrupted_valid_messages_never_panic(
+                message in 0usize..3,
+                edits in proptest::collection::vec((any::<prop::sample::Index>(), any::<u8>()), 1..8),
+                truncate in any::<prop::sample::Index>(),
+                should_truncate in any::<bool>(),
+            ) {
+                let mut data = valid_messages()[message].to_vec();
+                for (index, byte) in edits {
+                    let index = index.index(data.len());
+                    data[index] = byte;
+                }
+                if should_truncate {
+                    data.truncate(truncate.index(data.len()));
+                }
+
+                assert_well_formed(parse_snmp_trap(
+                    &Bytes::from(data),
+                    source_addr(),
+                ));
+            }
+        }
+    }
+}
