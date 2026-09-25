@@ -94,6 +94,34 @@ components: sources: snmp_trap: {
 					examples: ["1.3.6.1.4.1.8072.3.2.10"]
 				}
 			}
+			enterprise_oid_name: {
+				description: "The Net-SNMP style name of the enterprise OID, such as `SNMPv2-SMI::enterprises.8072.3.2.10` (SNMPv1 only)."
+				required:    false
+				type: string: {
+					examples: ["NET-SNMP-TC::linux"]
+				}
+			}
+			enterprise_oid_module: {
+				description: "The MIB module that defined the resolved enterprise OID name (SNMPv1 only)."
+				required:    false
+				type: string: {
+					examples: ["NET-SNMP-TC"]
+				}
+			}
+			enterprise_oid_symbol: {
+				description: "The symbol within the defining MIB module for the enterprise OID (SNMPv1 only)."
+				required:    false
+				type: string: {
+					examples: ["linux"]
+				}
+			}
+			enterprise_oid_instance: {
+				description: "The OID arcs after the enterprise OID symbol, if the OID extends a known definition (SNMPv1 only)."
+				required:    false
+				type: string: {
+					examples: ["0"]
+				}
+			}
 			agent_address: {
 				description: "The IP address of the SNMP agent (SNMPv1 only)."
 				required:    false
@@ -131,6 +159,34 @@ components: sources: snmp_trap: {
 					examples: ["1.3.6.1.6.3.1.1.5.1"]
 				}
 			}
+			trap_oid_name: {
+				description: "The Net-SNMP style name of the trap OID, using the longest known definition as a prefix."
+				required:    false
+				type: string: {
+					examples: ["SNMPv2-MIB::coldStart", "TEST-MIB::testTrap"]
+				}
+			}
+			trap_oid_module: {
+				description: "The MIB module that defined the resolved trap OID name."
+				required:    false
+				type: string: {
+					examples: ["SNMPv2-MIB", "TEST-MIB"]
+				}
+			}
+			trap_oid_symbol: {
+				description: "The symbol within the defining MIB module for the trap OID."
+				required:    false
+				type: string: {
+					examples: ["coldStart", "testTrap"]
+				}
+			}
+			trap_oid_instance: {
+				description: "The OID arcs after the trap OID symbol, if the OID extends a known definition."
+				required:    false
+				type: string: {
+					examples: ["0"]
+				}
+			}
 			request_id: {
 				description: "The request ID from the notification message (SNMPv2c only)."
 				required:    false
@@ -156,6 +212,34 @@ components: sources: snmp_trap: {
 						required:    true
 						type: string: {}
 					}
+					oid_name: {
+						description: "The Net-SNMP style name of the OID, using the longest known definition as a prefix."
+						required:    false
+						type: string: {
+							examples: ["SNMPv2-MIB::sysUpTime.0", "TEST-MIB::testValue.0"]
+						}
+					}
+					oid_module: {
+						description: "The MIB module that defined the resolved OID name."
+						required:    false
+						type: string: {
+							examples: ["SNMPv2-MIB", "TEST-MIB"]
+						}
+					}
+					oid_symbol: {
+						description: "The symbol within the defining MIB module for the OID."
+						required:    false
+						type: string: {
+							examples: ["sysUpTime", "testValue"]
+						}
+					}
+					oid_instance: {
+						description: "The OID arcs after the symbol, such as the `0` in `SNMPv2-MIB::sysUpTime.0`."
+						required:    false
+						type: string: {
+							examples: ["0"]
+						}
+					}
 					type: {
 						description: "The parsed SNMP value type."
 						required:    true
@@ -173,6 +257,34 @@ components: sources: snmp_trap: {
 						required:    false
 						type: string: {
 							examples: ["001122aabbcc", "deadbeef"]
+						}
+					}
+					value_oid_name: {
+						description: "The Net-SNMP style name of the value when the variable value is an ObjectIdentifier."
+						required:    false
+						type: string: {
+							examples: ["SNMPv2-MIB::coldStart", "TEST-MIB::testTrap"]
+						}
+					}
+					value_oid_module: {
+						description: "The MIB module that defined the resolved ObjectIdentifier value."
+						required:    false
+						type: string: {
+							examples: ["SNMPv2-MIB", "TEST-MIB"]
+						}
+					}
+					value_oid_symbol: {
+						description: "The symbol within the defining MIB module for the ObjectIdentifier value."
+						required:    false
+						type: string: {
+							examples: ["coldStart", "testTrap"]
+						}
+					}
+					value_oid_instance: {
+						description: "The OID arcs after the ObjectIdentifier value symbol, if the value extends a known definition."
+						required:    false
+						type: string: {
+							examples: ["0"]
 						}
 					}
 				}
@@ -211,6 +323,7 @@ components: sources: snmp_trap: {
 			title: "SNMPv2c Trap"
 			configuration: {
 				address: "0.0.0.0:162"
+				mib_paths: ["/etc/snmp/mibs"]
 			}
 			input: "[Binary SNMP trap data]"
 			output: log: {
@@ -220,10 +333,13 @@ components: sources: snmp_trap: {
 				community:       "public"
 				request_id:      12345
 				trap_oid:        "1.3.6.1.4.1.8072.2.3.0.1"
+				trap_oid_name:   "TEST-MIB::testTrap"
+				trap_oid_module: "TEST-MIB"
+				trap_oid_symbol: "testTrap"
 				uptime:          123456
 				varbinds: [
-					{oid: "1.3.6.1.2.1.1.3.0", type: "timeticks", value: "123456"},
-					{oid: "1.3.6.1.6.3.1.1.4.1.0", type: "object_identifier", value: "1.3.6.1.4.1.8072.2.3.0.1"},
+					{oid: "1.3.6.1.2.1.1.3.0", oid_name: "SNMPv2-MIB::sysUpTime.0", oid_module: "SNMPv2-MIB", oid_symbol: "sysUpTime", oid_instance: "0", type: "timeticks", value: "123456"},
+					{oid: "1.3.6.1.6.3.1.1.4.1.0", oid_name: "SNMPv2-MIB::snmpTrapOID.0", oid_module: "SNMPv2-MIB", oid_symbol: "snmpTrapOID", oid_instance: "0", type: "object_identifier", value: "1.3.6.1.4.1.8072.2.3.0.1", value_oid_name: "TEST-MIB::testTrap", value_oid_module: "TEST-MIB", value_oid_symbol: "testTrap"},
 				]
 				message:     "SNMPv2c trap from 192.168.1.100:49152: 1.3.6.1.4.1.8072.2.3.0.1"
 				host:        "192.168.1.100"
@@ -292,9 +408,40 @@ components: sources: snmp_trap: {
 				two varbinds to be `sysUpTime.0` and `snmpTrapOID.0`, in that order. Vector
 				rejects SNMPv2c notifications that do not follow that ordering or use the wrong
 				value types.
+				Vector preserves numeric OIDs as received. When MIBs are configured, Vector adds
+				resolved names in separate fields for varbind OIDs and ObjectIdentifier values.
 				"""
 		}
 
+		mib_resolution: {
+			title: "MIB Resolution"
+			body:  """
+				Use `mib_paths` to load MIB files or directories. Directories are scanned
+				recursively at source startup with bounded depth, file count, and file size.
+				Symlinked directories are skipped, symlinked files are allowed, and directory
+				scans include files with `.mib`, `.my`, `.smi`, `.txt`, or no extension. Vector
+				resolves [RFC 2578](\(urls.rfc_2578)) SMIv2 object identifier assignments such as
+				`OBJECT IDENTIFIER`, `OBJECT-TYPE`, `OBJECT-IDENTITY`, `MODULE-IDENTITY`, and
+				`NOTIFICATION-TYPE`, conformance definitions, and SMIv1 `TRAP-TYPE` definitions.
+
+				Resolved names are emitted in fields such as `trap_oid_name`, `enterprise_oid_name`,
+				`varbinds[].oid_name`, and `varbinds[].value_oid_name`. Numeric OIDs remain in
+				`trap_oid`, `enterprise_oid`, `varbinds[].oid`, and `varbinds[].value`.
+
+				Names follow Net-SNMP's `snmptrapd` conventions: an OID is named after the longest
+				known definition that prefixes it, and any remaining arcs are appended, for example
+				`IF-MIB::ifDescr.3` or `SNMPv2-SMI::enterprises.8072.1`. A small set of standard
+				SMI and SNMPv2 definitions is always known, so most OIDs get a name even without
+				`mib_paths`. Table index values are appended as numeric arcs rather than decoded
+				from the table's `INDEX` clause.
+
+				References are resolved within each module's own definitions and `IMPORTS` first.
+				When several modules define the same OID, SMIv2 modules take precedence over SMIv1
+				modules, a module never overrides a definition from a module it imports, and
+				otherwise the first loaded definition is used. MIB resolution is best-effort and
+				does not evaluate every ASN.1/SMI construct.
+				"""
+		}
 
 		port_privileges: {
 			title: "Port Privileges"

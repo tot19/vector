@@ -17,6 +17,9 @@ sources:
   snmp_traps:
     type: snmp_trap
     address: "0.0.0.0:1162"
+    # Optional: load MIB files or directories recursively to resolve OID names.
+    # mib_paths:
+    #   - "/etc/snmp/mibs"
     # Optional: Set receive buffer size
     receive_buffer_bytes: 65536
 
@@ -49,6 +52,9 @@ transforms:
       } else {
         .delivery = "unconfirmed"
       }
+
+      # Use resolved trap names when MIBs define them, but keep numeric OIDs available.
+      .trap_name = if .trap_oid_name != null { .trap_oid_name } else { .trap_oid }
 
 # Output to console for inspection
 sinks:

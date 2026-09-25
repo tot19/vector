@@ -1,0 +1,87 @@
+VECTOR-TEST-MIB DEFINITIONS ::= BEGIN
+
+enterprises OBJECT IDENTIFIER ::= { 1 3 6 1 4 1 }
+
+vectorTestRoot OBJECT IDENTIFIER ::= { enterprises 8072 9999 }
+vectorTestNotifications OBJECT IDENTIFIER ::= { vectorTestRoot 0 }
+vectorTestObjects OBJECT IDENTIFIER ::= { vectorTestRoot 1 }
+
+vectorTestTrap NOTIFICATION-TYPE
+    OBJECTS { vectorTestValue, vectorTestText, vectorTestBytes, vectorTestUnsigned,
+              vectorTestCounter, vectorTestTimeticks, vectorTestIpAddress,
+              vectorTestObjectId, vectorTestNull, vectorTestDecimalBytes }
+    STATUS current
+    DESCRIPTION "Notification used by Vector's SNMP trap integration tests."
+    ::= { vectorTestNotifications 1 }
+
+vectorTestValue OBJECT-TYPE
+    SYNTAX Integer32
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Integer value used by Vector's SNMP trap integration tests."
+    ::= { vectorTestObjects 1 }
+
+vectorTestText OBJECT-TYPE
+    SYNTAX OCTET STRING
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Text value used by Vector's SNMP trap integration tests."
+    ::= { vectorTestObjects 2 }
+
+vectorTestBytes OBJECT-TYPE
+    SYNTAX OCTET STRING
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Binary value used by Vector's SNMP trap integration tests."
+    ::= { vectorTestObjects 3 }
+
+vectorTestUnsigned OBJECT-TYPE
+    SYNTAX Gauge32
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Unsigned value used by Vector's SNMP trap integration tests."
+    ::= { vectorTestObjects 4 }
+
+vectorTestCounter OBJECT-TYPE
+    SYNTAX Counter32
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Counter value used by Vector's SNMP trap integration tests."
+    ::= { vectorTestObjects 5 }
+
+vectorTestTimeticks OBJECT-TYPE
+    SYNTAX TimeTicks
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Timeticks value used by Vector's SNMP trap integration tests."
+    ::= { vectorTestObjects 6 }
+
+vectorTestIpAddress OBJECT-TYPE
+    SYNTAX IpAddress
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "IP address value used by Vector's SNMP trap integration tests."
+    ::= { vectorTestObjects 7 }
+
+vectorTestObjectId OBJECT-TYPE
+    SYNTAX OBJECT IDENTIFIER
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Object identifier value used by Vector's SNMP trap integration tests."
+    ::= { vectorTestObjects 8 }
+
+vectorTestNull OBJECT-TYPE
+    SYNTAX OCTET STRING
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Null value used by Vector's SNMP trap integration tests."
+    ::= { vectorTestObjects 9 }
+
+vectorTestDecimalBytes OBJECT-TYPE
+    SYNTAX OCTET STRING
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Decimal byte string used by Vector's SNMP trap integration tests."
+    ::= { vectorTestObjects 10 }
+
+END

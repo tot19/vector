@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use chrono::Utc;
 use listenfd::ListenFd;
+use std::path::PathBuf;
 use tokio::net::UdpSocket;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf,
@@ -24,8 +25,10 @@ use crate::{
     sources::util::net::{SocketListenAddr, try_bind_udp_socket},
 };
 
+mod mib;
 mod parser;
 
+use mib::MibResolver;
 use parser::{MAX_SNMP_MESSAGE_SIZE, parse_snmp_trap};
 
 /// Configuration for the `snmp_trap` source.
@@ -57,6 +60,15 @@ pub struct SnmpTrapConfig {
     /// [global_host_key]: https://vector.dev/docs/reference/configuration/global-options/#log_schema.host_key
     host_key: Option<OptionalValuePath>,
 
+    /// MIB files or directories to load for OID name resolution.
+    ///
+    /// Directories are scanned recursively with bounded depth and file count, without following
+    /// symlinked directories. Directory scans load files with common MIB extensions or no
+    /// extension, and each MIB file must be at most 8 MiB. Numeric OIDs are always preserved, and
+    /// resolved names are added in separate metadata fields.
+    #[serde(default)]
+    mib_paths: Vec<PathBuf>,
+
     /// The namespace to use for logs. This overrides the global setting.
     #[configurable(metadata(docs::hidden))]
     #[serde(default)]
@@ -76,9 +88,17 @@ impl SnmpTrapConfig {
             Collection::empty().with_unknown(Kind::object(
                 Collection::empty()
                     .with_known("oid", Kind::bytes())
+                    .with_known("oid_name", Kind::bytes().or_undefined())
+                    .with_known("oid_module", Kind::bytes().or_undefined())
+                    .with_known("oid_symbol", Kind::bytes().or_undefined())
+                    .with_known("oid_instance", Kind::bytes().or_undefined())
                     .with_known("type", Kind::bytes())
                     .with_known("value", Kind::bytes())
-                    .with_known("value_bytes_hex", Kind::bytes().or_undefined()),
+                    .with_known("value_bytes_hex", Kind::bytes().or_undefined())
+                    .with_known("value_oid_name", Kind::bytes().or_undefined())
+                    .with_known("value_oid_module", Kind::bytes().or_undefined())
+                    .with_known("value_oid_symbol", Kind::bytes().or_undefined())
+                    .with_known("value_oid_instance", Kind::bytes().or_undefined()),
             )),
         );
 
@@ -92,6 +112,26 @@ impl SnmpTrapConfig {
         .with_event_field(&owned_value_path!("community"), Kind::bytes(), None)
         .with_event_field(
             &owned_value_path!("enterprise_oid"),
+            Kind::bytes().or_undefined(),
+            None,
+        )
+        .with_event_field(
+            &owned_value_path!("enterprise_oid_name"),
+            Kind::bytes().or_undefined(),
+            None,
+        )
+        .with_event_field(
+            &owned_value_path!("enterprise_oid_module"),
+            Kind::bytes().or_undefined(),
+            None,
+        )
+        .with_event_field(
+            &owned_value_path!("enterprise_oid_symbol"),
+            Kind::bytes().or_undefined(),
+            None,
+        )
+        .with_event_field(
+            &owned_value_path!("enterprise_oid_instance"),
             Kind::bytes().or_undefined(),
             None,
         )
@@ -122,6 +162,26 @@ impl SnmpTrapConfig {
         )
         .with_event_field(&owned_value_path!("trap_oid"), Kind::bytes(), None)
         .with_event_field(
+            &owned_value_path!("trap_oid_name"),
+            Kind::bytes().or_undefined(),
+            None,
+        )
+        .with_event_field(
+            &owned_value_path!("trap_oid_module"),
+            Kind::bytes().or_undefined(),
+            None,
+        )
+        .with_event_field(
+            &owned_value_path!("trap_oid_symbol"),
+            Kind::bytes().or_undefined(),
+            None,
+        )
+        .with_event_field(
+            &owned_value_path!("trap_oid_instance"),
+            Kind::bytes().or_undefined(),
+            None,
+        )
+        .with_event_field(
             &owned_value_path!("uptime"),
             Kind::integer().or_undefined(),
             None,
@@ -149,6 +209,7 @@ impl Default for SnmpTrapConfig {
             address: SocketListenAddr::SocketAddr("0.0.0.0:162".parse().unwrap()),
             receive_buffer_bytes: None,
             host_key: None,
+            mib_paths: Vec::new(),
             log_namespace: None,
         }
     }
@@ -166,6 +227,11 @@ impl SourceConfig for SnmpTrapConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let host_key = self.host_key();
+        // MIB loading can scan many files, so keep it off the async runtime threads.
+        let mib_paths = self.mib_paths.clone();
+        let mib_resolver =
+            tokio::task::spawn_blocking(move || MibResolver::from_paths(&mib_paths)).await??;
+
         // Bind while building so that address conflicts fail the configuration load.
         let socket = try_bind_udp_socket(self.address, ListenFd::from_env())
             .await
@@ -181,6 +247,7 @@ impl SourceConfig for SnmpTrapConfig {
             self.address,
             self.receive_buffer_bytes,
             host_key,
+            mib_resolver,
             cx.shutdown,
             log_namespace,
             cx.out,
@@ -212,6 +279,7 @@ async fn snmp_trap_udp(
     address: SocketListenAddr,
     receive_buffer_bytes: Option<usize>,
     host_key: Option<OwnedValuePath>,
+    mib_resolver: MibResolver,
     shutdown: ShutdownSignal,
     log_namespace: LogNamespace,
     mut out: SourceSender,
@@ -250,7 +318,7 @@ async fn snmp_trap_udp(
                 bytes_received.emit(ByteSize(byte_size));
                 let data = Bytes::copy_from_slice(&buf[..byte_size]);
 
-                match parse_snmp_trap(&data, peer_addr) {
+                match parse_snmp_trap(&data, peer_addr, &mib_resolver) {
                     Ok(mut notification) => {
                         let count = notification.events.len();
                         emit!(SocketEventsReceived {
@@ -375,6 +443,7 @@ mod tests {
             address: SocketListenAddr::SocketAddr(addr),
             receive_buffer_bytes: None,
             host_key: None,
+            mib_paths: Vec::new(),
             log_namespace: None,
         };
 
@@ -395,6 +464,7 @@ mod tests {
             address: SocketListenAddr::SocketAddr(occupied.local_addr().unwrap()),
             receive_buffer_bytes: None,
             host_key: None,
+            mib_paths: Vec::new(),
             log_namespace: None,
         };
 
@@ -425,6 +495,7 @@ mod tests {
             address: SocketListenAddr::SocketAddr(addr),
             receive_buffer_bytes: Some(65536),
             host_key: Some(OptionalValuePath::from(host_path)),
+            mib_paths: Vec::new(),
             log_namespace: None,
         };
 
@@ -437,6 +508,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_config_rejects_missing_mib_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = SnmpTrapConfig {
+            address: SocketListenAddr::SocketAddr("127.0.0.1:0".parse().unwrap()),
+            receive_buffer_bytes: None,
+            host_key: None,
+            mib_paths: vec![temp_dir.path().join("missing")],
+            log_namespace: None,
+        };
+
+        let (tx, _rx) = SourceSender::new_test();
+        let error = match SourceConfig::build(&config, SourceContext::new_test(tx, None)).await {
+            Ok(_) => panic!("expected missing MIB path to fail source build"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("Failed to read MIB path"));
+    }
+
+    #[tokio::test]
     async fn test_udp_source_receives_trap_with_metadata() {
         assert_source_compliance(&SOCKET_PUSH_SOURCE_TAGS, async move {
             let (_guard, addr) = next_addr();
@@ -444,6 +535,7 @@ mod tests {
                 address: SocketListenAddr::SocketAddr(addr),
                 receive_buffer_bytes: None,
                 host_key: None,
+                mib_paths: Vec::new(),
                 log_namespace: None,
             };
 
@@ -489,6 +581,7 @@ mod tests {
             address: SocketListenAddr::SocketAddr(addr),
             receive_buffer_bytes: None,
             host_key: Some(OptionalValuePath::from(host_path)),
+            mib_paths: Vec::new(),
             log_namespace: None,
         };
 
@@ -528,6 +621,7 @@ mod tests {
             address: SocketListenAddr::SocketAddr(addr),
             receive_buffer_bytes: None,
             host_key: Some(OptionalValuePath::none()),
+            mib_paths: Vec::new(),
             log_namespace: None,
         };
 
@@ -567,6 +661,7 @@ mod tests {
                 address: SocketListenAddr::SocketAddr(addr),
                 receive_buffer_bytes: None,
                 host_key: None,
+                mib_paths: Vec::new(),
                 log_namespace: Some(log_namespace == LogNamespace::Vector),
             };
             let definition = config
@@ -629,6 +724,7 @@ mod tests {
             address: SocketListenAddr::SocketAddr(addr),
             receive_buffer_bytes: None,
             host_key: None,
+            mib_paths: Vec::new(),
             log_namespace: None,
         };
 
@@ -682,6 +778,7 @@ mod tests {
             address: SocketListenAddr::SocketAddr(addr),
             receive_buffer_bytes: None,
             host_key: None,
+            mib_paths: Vec::new(),
             log_namespace: None,
         };
 
@@ -722,6 +819,7 @@ mod tests {
             address: SocketListenAddr::SocketAddr(addr),
             receive_buffer_bytes: None,
             host_key: None,
+            mib_paths: Vec::new(),
             log_namespace: None,
         };
 
@@ -763,6 +861,7 @@ mod tests {
             address: SocketListenAddr::SocketAddr(addr),
             receive_buffer_bytes: None,
             host_key: None,
+            mib_paths: Vec::new(),
             log_namespace: None,
         };
 
@@ -809,12 +908,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_udp_source_resolves_mib_oids() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mib_path = temp_dir.path().join("TEST-MIB.txt");
+        std::fs::write(&mib_path, TEST_MIB).unwrap();
+
+        let (_guard, addr) = next_addr();
+        let config = SnmpTrapConfig {
+            address: SocketListenAddr::SocketAddr(addr),
+            receive_buffer_bytes: None,
+            host_key: None,
+            mib_paths: vec![temp_dir.path().to_path_buf()],
+            log_namespace: None,
+        };
+
+        let key = ComponentKey::from("snmp_trap");
+        let (tx, mut rx) = SourceSender::new_test();
+        let (context, shutdown) = SourceContext::new_shutdown(&key, tx);
+        let shutdown_complete = shutdown.shutdown_tripwire();
+
+        let source = config.build(context).await.unwrap();
+        tokio::spawn(source);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket
+            .send_to(&v2c_notification(PduType::TrapV2), addr)
+            .await
+            .unwrap();
+
+        let event = timeout(Duration::from_secs(2), rx.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let log = event.as_log();
+        assert_eq!(log["trap_oid_name"], "TEST-MIB::testTrap".into());
+        assert_eq!(log["trap_oid_module"], "TEST-MIB".into());
+        assert_eq!(log["trap_oid_symbol"], "testTrap".into());
+
+        let varbinds = log["varbinds"].as_array().unwrap();
+        assert_eq!(
+            varbinds[1].get(path!("value_oid_name")).unwrap(),
+            &"TEST-MIB::testTrap".into()
+        );
+        assert_eq!(
+            varbinds[2].get(path!("oid_name")).unwrap(),
+            &"TEST-MIB::testValue.0".into()
+        );
+        assert_eq!(varbinds[2].get(path!("oid_instance")).unwrap(), &"0".into());
+
+        shutdown
+            .shutdown_all(Some(Instant::now() + Duration::from_millis(100)))
+            .await;
+        shutdown_complete.await;
+    }
+
+    #[tokio::test]
     async fn test_udp_source_drops_garbage_bytes_without_crashing() {
         let (_guard, addr) = next_addr();
         let config = SnmpTrapConfig {
             address: SocketListenAddr::SocketAddr(addr),
             receive_buffer_bytes: None,
             host_key: None,
+            mib_paths: Vec::new(),
             log_namespace: None,
         };
 
@@ -863,6 +1018,7 @@ mod tests {
             address: SocketListenAddr::SocketAddr(addr),
             receive_buffer_bytes: None,
             host_key: None,
+            mib_paths: Vec::new(),
             log_namespace: None,
         };
 
@@ -952,6 +1108,35 @@ mod tests {
             ],
         )
     }
+
+    const TEST_MIB: &str = r#"
+TEST-MIB DEFINITIONS ::= BEGIN
+
+IMPORTS
+    enterprises, OBJECT-TYPE, NOTIFICATION-TYPE
+        FROM SNMPv2-SMI;
+
+testRoot OBJECT IDENTIFIER ::= { enterprises 8072 }
+testNotifications OBJECT IDENTIFIER ::= { testRoot 2 }
+testNotificationPrefix OBJECT IDENTIFIER ::= { testNotifications 3 }
+testSpecificNotifications OBJECT IDENTIFIER ::= { testNotificationPrefix 0 }
+
+testTrap NOTIFICATION-TYPE
+    OBJECTS { testValue }
+    STATUS current
+    DESCRIPTION "A test notification."
+    ::= { testSpecificNotifications 1 }
+
+testObjects OBJECT IDENTIFIER ::= { testNotifications 4 }
+testValue OBJECT-TYPE
+    SYNTAX Integer32
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "A test value."
+    ::= { testObjects 1 }
+
+END
+"#;
 
     fn v2c_message(pdu_type: PduType, request_id: u32, varbinds: Vec<Vec<u8>>) -> Vec<u8> {
         let mut varbind_list = Vec::new();

@@ -25,6 +25,21 @@ generated: components: sources: snmp_trap: configuration: {
 		required: false
 		type: string: {}
 	}
+	mib_paths: {
+		description: """
+			MIB files or directories to load for OID name resolution.
+
+			Directories are scanned recursively with bounded depth and file count, without following
+			symlinked directories. Directory scans load files with common MIB extensions or no
+			extension, and each MIB file must be at most 8 MiB. Numeric OIDs are always preserved, and
+			resolved names are added in separate metadata fields.
+			"""
+		required: false
+		type: array: {
+			default: []
+			items: type: string: {}
+		}
+	}
 	receive_buffer_bytes: {
 		description: """
 			The size of the receive buffer used for the listening socket.

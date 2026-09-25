@@ -2,6 +2,7 @@
 
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     process::{Command, Output},
     time::Duration,
 };
@@ -76,6 +77,7 @@ async fn start_source() -> RunningSource {
         address: SocketListenAddr::SocketAddr(address),
         receive_buffer_bytes: None,
         host_key: None,
+        mib_paths: vec![test_mib_path()],
         log_namespace: None,
     };
 
@@ -91,6 +93,11 @@ async fn start_source() -> RunningSource {
         shutdown,
         task,
     }
+}
+
+fn test_mib_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/integration/snmp-trap/data/VECTOR-TEST-MIB.txt")
 }
 
 fn net_snmp_target(address: SocketAddr) -> String {
@@ -191,8 +198,16 @@ async fn net_snmp_v2c_trap_is_ingested_and_resolved() {
     assert_eq!(log["pdu_type"], Value::from("trap_v2"));
     assert_eq!(log["community"], Value::from("public"));
     assert_eq!(log["trap_oid"], Value::from(TRAP_OID_NO_DOT));
+    assert_eq!(
+        log["trap_oid_name"],
+        Value::from("VECTOR-TEST-MIB::vectorTestTrap")
+    );
 
     let value = varbind(&log, VALUE_OID_NO_DOT);
+    assert_eq!(
+        value.get(path!("oid_name")).unwrap(),
+        &Value::from("VECTOR-TEST-MIB::vectorTestValue.0")
+    );
     assert_eq!(value.get(path!("value")).unwrap(), &Value::from("7"));
 
     let text = varbind(&log, TEXT_OID_NO_DOT);
@@ -352,6 +367,10 @@ async fn net_snmp_v2c_inform_receives_response_and_is_ingested() {
     assert_eq!(log["snmp_version"], Value::from("2c"));
     assert_eq!(log["pdu_type"], Value::from("inform_request"));
     assert_eq!(log["trap_oid"], Value::from(TRAP_OID_NO_DOT));
+    assert_eq!(
+        log["trap_oid_name"],
+        Value::from("VECTOR-TEST-MIB::vectorTestTrap")
+    );
     assert!(log["request_id"].as_integer().is_some());
 
     let output = tokio::time::timeout(Duration::from_secs(3), command)
@@ -404,8 +423,16 @@ async fn net_snmp_v1_enterprise_specific_trap_is_ingested() {
     assert_eq!(log["community"], Value::from("public"));
     assert_eq!(log["generic_trap"], Value::from(6));
     assert_eq!(log["specific_trap"], Value::from(42));
+    assert_eq!(
+        log["enterprise_oid_name"],
+        Value::from("VECTOR-TEST-MIB::vectorTestRoot")
+    );
 
     let value = varbind(&log, VALUE_OID_NO_DOT);
+    assert_eq!(
+        value.get(path!("oid_name")).unwrap(),
+        &Value::from("VECTOR-TEST-MIB::vectorTestValue.0")
+    );
     assert_eq!(value.get(path!("value")).unwrap(), &Value::from("11"));
 
     source.stop().await;

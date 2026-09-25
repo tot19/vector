@@ -14,6 +14,8 @@ use vector_lib::{
     lookup::event_path,
 };
 
+use super::mib::{MibResolver, OidResolution};
+
 pub(crate) const MAX_SNMP_MESSAGE_SIZE: usize = 65_507;
 
 const SYS_UP_TIME_OID: &str = "1.3.6.1.2.1.1.3.0";
@@ -84,23 +86,24 @@ impl ParseError {
 pub fn parse_snmp_trap(
     data: &Bytes,
     source_addr: SocketAddr,
+    mib_resolver: &MibResolver,
 ) -> Result<ParsedSnmpNotification, ParseError> {
     if let Ok((remaining, message)) = parse_snmp_v1(data) {
         ensure_consumed(remaining)?;
-        return parse_v1_trap(message, data, source_addr);
+        return parse_v1_trap(message, data, source_addr, mib_resolver);
     }
 
     if let Ok((remaining, message)) = parse_snmp_v2c(data) {
         ensure_consumed(remaining)?;
         let request_id = raw_v2c_request_id(data)?;
-        return parse_v2c_notification(message, data, request_id, source_addr);
+        return parse_v2c_notification(message, data, request_id, source_addr, mib_resolver);
     }
 
     if let Some((patched, request_id)) = patch_negative_v2c_request_id(data)?
         && let Ok((remaining, message)) = parse_snmp_v2c(&patched)
     {
         ensure_consumed(remaining)?;
-        return parse_v2c_notification(message, data, request_id, source_addr);
+        return parse_v2c_notification(message, data, request_id, source_addr, mib_resolver);
     }
 
     if parse_snmp_v3(data).is_ok() {
@@ -130,6 +133,7 @@ fn parse_v1_trap(
     message: SnmpMessage<'_>,
     data: &Bytes,
     source_addr: SocketAddr,
+    mib_resolver: &MibResolver,
 ) -> Result<ParsedSnmpNotification, ParseError> {
     match message.pdu {
         SnmpPdu::TrapV1(trap) => {
@@ -150,6 +154,7 @@ fn parse_v1_trap(
             log.insert(event_path!("source_address"), source_addr.to_string());
             log.insert(event_path!("community"), message.community);
             log.insert(event_path!("enterprise_oid"), enterprise_oid.as_str());
+            insert_oid_resolution(&mut log, "enterprise_oid", &enterprise_oid, mib_resolver);
             log.insert(
                 event_path!("agent_address"),
                 format_network_address(trap.agent_addr),
@@ -162,12 +167,14 @@ fn parse_v1_trap(
             log.insert(event_path!("specific_trap"), trap.specific_trap as i64);
             let trap_oid = v1_trap_oid(&enterprise_oid, generic_trap, trap.specific_trap);
             log.insert(event_path!("trap_oid"), trap_oid.as_str());
+            insert_oid_resolution(&mut log, "trap_oid", &trap_oid, mib_resolver);
             log.insert(event_path!("uptime"), trap.timestamp as i64);
             log.insert(
                 event_path!("varbinds"),
                 format_varbinds(
                     &trap.var,
                     &raw_varbind_list(data, V1_FIELDS_BEFORE_VARBINDS)?,
+                    mib_resolver,
                 ),
             );
             log.insert(
@@ -194,6 +201,7 @@ fn parse_v2c_notification(
     data: &[u8],
     request_id: i64,
     source_addr: SocketAddr,
+    mib_resolver: &MibResolver,
 ) -> Result<ParsedSnmpNotification, ParseError> {
     match message.pdu {
         SnmpPdu::Generic(ref pdu)
@@ -216,9 +224,10 @@ fn parse_v2c_notification(
             log.insert(event_path!("request_id"), request_id);
             log.insert(event_path!("uptime"), uptime);
             log.insert(event_path!("trap_oid"), trap_oid.clone());
+            insert_oid_resolution(&mut log, "trap_oid", &trap_oid, mib_resolver);
             log.insert(
                 event_path!("varbinds"),
-                format_varbinds(&pdu.var, &raw_varbinds),
+                format_varbinds(&pdu.var, &raw_varbinds, mib_resolver),
             );
             log.insert(
                 event_path!("message"),
@@ -544,6 +553,7 @@ fn validate_request_id(value: i64) -> Result<i64, ParseError> {
 fn format_varbinds(
     variables: &[SnmpVariable<'_>],
     raw_varbinds: &RawVarbinds<'_>,
+    mib_resolver: &MibResolver,
 ) -> Vec<serde_json::Value> {
     variables
         .iter()
@@ -577,6 +587,13 @@ fn format_varbinds(
                 varbind.insert("value_bytes_hex".to_string(), json!(value_bytes_hex));
             }
 
+            insert_json_oid_resolution(&mut varbind, "oid", &oid, mib_resolver);
+
+            if let VarBindValue::Value(ObjectSyntax::Object(value_oid)) = &variable.val {
+                let value_oid = value_oid.to_string();
+                insert_json_oid_resolution(&mut varbind, "value_oid", &value_oid, mib_resolver);
+            }
+
             serde_json::Value::Object(varbind)
         })
         .collect()
@@ -587,6 +604,49 @@ struct FormattedVarbindValue {
     value_type: &'static str,
     value: String,
     value_bytes_hex: Option<String>,
+}
+
+fn insert_oid_resolution(log: &mut LogEvent, prefix: &str, oid: &str, mib_resolver: &MibResolver) {
+    if let Some(resolution) = mib_resolver.resolve(oid) {
+        let field = format!("{prefix}_name");
+        log.insert(event_path!(field.as_str()), resolution.name);
+        if let Some(module) = resolution.module {
+            let field = format!("{prefix}_module");
+            log.insert(event_path!(field.as_str()), module);
+        }
+        let field = format!("{prefix}_symbol");
+        log.insert(event_path!(field.as_str()), resolution.symbol);
+        if let Some(instance) = resolution.instance {
+            let field = format!("{prefix}_instance");
+            log.insert(event_path!(field.as_str()), instance);
+        }
+    }
+}
+
+fn insert_json_oid_resolution(
+    value: &mut serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+    oid: &str,
+    mib_resolver: &MibResolver,
+) {
+    if let Some(resolution) = mib_resolver.resolve(oid) {
+        insert_json_resolution(value, prefix, resolution);
+    }
+}
+
+fn insert_json_resolution(
+    value: &mut serde_json::Map<String, serde_json::Value>,
+    prefix: &str,
+    resolution: OidResolution,
+) {
+    value.insert(format!("{prefix}_name"), json!(resolution.name));
+    if let Some(module) = resolution.module {
+        value.insert(format!("{prefix}_module"), json!(module));
+    }
+    value.insert(format!("{prefix}_symbol"), json!(resolution.symbol));
+    if let Some(instance) = resolution.instance {
+        value.insert(format!("{prefix}_instance"), json!(instance));
+    }
 }
 
 fn format_varbind_value(value: &VarBindValue<'_>) -> FormattedVarbindValue {
@@ -868,6 +928,10 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1162)
     }
 
+    fn mib_resolver() -> MibResolver {
+        MibResolver::with_builtin_symbols()
+    }
+
     fn oid(arcs: &[u64]) -> Vec<u8> {
         assert!(arcs.len() >= 2);
         let mut encoded = vec![(arcs[0] * 40 + arcs[1]) as u8];
@@ -1083,7 +1147,7 @@ mod tests {
 
     #[test]
     fn test_parse_v1_trap() {
-        let parsed = parse_snmp_trap(&v1_trap(), source_addr()).unwrap();
+        let parsed = parse_snmp_trap(&v1_trap(), source_addr(), &mib_resolver()).unwrap();
         assert!(parsed.response.is_none());
 
         let log = parsed.events[0].as_log();
@@ -1102,29 +1166,61 @@ mod tests {
 
     #[test]
     fn test_parse_v1_generic_trap_translates_trap_oid() {
-        let parsed =
-            parse_snmp_trap(&v1_trap_with_generic_trap(integer(2)), source_addr()).unwrap();
+        let parsed = parse_snmp_trap(
+            &v1_trap_with_generic_trap(integer(2)),
+            source_addr(),
+            &mib_resolver(),
+        )
+        .unwrap();
 
         let log = parsed.events[0].as_log();
         assert_eq!(log["generic_trap_name"], Value::from("linkDown"));
         assert_eq!(log["trap_oid"], Value::from("1.3.6.1.6.3.1.1.5.3"));
+        assert_eq!(log["trap_oid_name"], Value::from("IF-MIB::linkDown"));
     }
 
     #[test]
     fn test_parse_v1_trap_rejects_unknown_generic_trap() {
-        let result = parse_snmp_trap(&v1_trap_with_generic_trap(integer(7)), source_addr());
+        let result = parse_snmp_trap(
+            &v1_trap_with_generic_trap(integer(7)),
+            source_addr(),
+            &mib_resolver(),
+        );
         assert!(matches!(result, Err(ParseError::InvalidV1Trap(_))));
     }
 
     #[test]
     fn test_parse_v1_trap_rejects_wrapped_generic_trap() {
-        let result = parse_snmp_trap(&v1_trap_with_generic_trap(integer(256)), source_addr());
+        let result = parse_snmp_trap(
+            &v1_trap_with_generic_trap(integer(256)),
+            source_addr(),
+            &mib_resolver(),
+        );
         assert!(matches!(result, Err(ParseError::InvalidV1Trap(_))));
     }
 
     #[test]
+    fn test_parse_v1_trap_with_mib_resolution() {
+        let resolver = MibResolver::from_str(TEST_MIB);
+        let parsed = parse_snmp_trap(&v1_trap(), source_addr(), &resolver).unwrap();
+
+        let log = parsed.events[0].as_log();
+        assert_eq!(
+            log["enterprise_oid_name"],
+            Value::from("TEST-MIB::testTrap")
+        );
+        assert_eq!(log["enterprise_oid_module"], Value::from("TEST-MIB"));
+        assert_eq!(log["enterprise_oid_symbol"], Value::from("testTrap"));
+    }
+
+    #[test]
     fn test_parse_v2c_trap() {
-        let parsed = parse_snmp_trap(&v2c_notification(PduType::TrapV2), source_addr()).unwrap();
+        let parsed = parse_snmp_trap(
+            &v2c_notification(PduType::TrapV2),
+            source_addr(),
+            &mib_resolver(),
+        )
+        .unwrap();
         assert!(parsed.response.is_none());
 
         let log = parsed.events[0].as_log();
@@ -1133,6 +1229,11 @@ mod tests {
         assert_eq!(log["request_id"], Value::from(42));
         assert_eq!(log["uptime"], Value::from(123_456));
         assert_eq!(log["trap_oid"], Value::from("1.3.6.1.4.1.8072.2.3.0.1"));
+        assert_eq!(
+            log["trap_oid_name"],
+            Value::from("SNMPv2-SMI::enterprises.8072.2.3.0.1")
+        );
+        assert_eq!(log["trap_oid_instance"], Value::from("8072.2.3.0.1"));
 
         let varbinds = log["varbinds"].as_array().unwrap();
         assert_eq!(varbinds.len(), 3);
@@ -1147,9 +1248,43 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_v2c_inform_builds_response() {
+    fn test_parse_v2c_trap_with_mib_resolution() {
+        let resolver = MibResolver::from_str(TEST_MIB);
         let parsed =
-            parse_snmp_trap(&v2c_notification(PduType::InformRequest), source_addr()).unwrap();
+            parse_snmp_trap(&v2c_notification(PduType::TrapV2), source_addr(), &resolver).unwrap();
+
+        let log = parsed.events[0].as_log();
+        assert_eq!(log["trap_oid_name"], Value::from("TEST-MIB::testTrap"));
+        assert_eq!(log["trap_oid_module"], Value::from("TEST-MIB"));
+        assert_eq!(log["trap_oid_symbol"], Value::from("testTrap"));
+
+        let varbinds = log["varbinds"].as_array().unwrap();
+        assert_eq!(
+            varbinds[0].get(path!("oid_name")).unwrap(),
+            &Value::from("SNMPv2-MIB::sysUpTime.0")
+        );
+        assert_eq!(
+            varbinds[1].get(path!("value_oid_name")).unwrap(),
+            &Value::from("TEST-MIB::testTrap")
+        );
+        assert_eq!(
+            varbinds[2].get(path!("oid_name")).unwrap(),
+            &Value::from("TEST-MIB::testValue.0")
+        );
+        assert_eq!(
+            varbinds[2].get(path!("oid_instance")).unwrap(),
+            &Value::from("0")
+        );
+    }
+
+    #[test]
+    fn test_parse_v2c_inform_builds_response() {
+        let parsed = parse_snmp_trap(
+            &v2c_notification(PduType::InformRequest),
+            source_addr(),
+            &mib_resolver(),
+        )
+        .unwrap();
         let response = parsed.response.expect("inform should produce a response");
 
         let (_, response) = parse_snmp_v2c(&response).unwrap();
@@ -1176,6 +1311,7 @@ mod tests {
                 notification_varbinds(),
             ),
             source_addr(),
+            &mib_resolver(),
         )
         .unwrap();
 
@@ -1199,6 +1335,7 @@ mod tests {
                 notification_varbinds(),
             ),
             source_addr(),
+            &mib_resolver(),
         );
         assert!(matches!(result, Err(ParseError::InvalidRequestId(_))));
     }
@@ -1223,6 +1360,7 @@ mod tests {
                 ],
             ),
             source_addr(),
+            &mib_resolver(),
         )
         .unwrap();
         let response = parsed
@@ -1253,6 +1391,7 @@ mod tests {
                 required_notification_varbinds(),
             ),
             source_addr(),
+            &mib_resolver(),
         )
         .unwrap();
 
@@ -1277,6 +1416,7 @@ mod tests {
                 ],
             ),
             source_addr(),
+            &mib_resolver(),
         )
         .unwrap();
 
@@ -1315,6 +1455,7 @@ mod tests {
                 ],
             ),
             source_addr(),
+            &mib_resolver(),
         )
         .unwrap();
 
@@ -1346,6 +1487,7 @@ mod tests {
                 vec![varbind(&[1, 3, 6, 1, 4, 1, 8072, 2, 4, 1, 0], integer(7))],
             ),
             source_addr(),
+            &mib_resolver(),
         );
         assert!(matches!(
             result,
@@ -1370,6 +1512,7 @@ mod tests {
                 ],
             ),
             source_addr(),
+            &mib_resolver(),
         );
         assert!(matches!(
             result,
@@ -1394,6 +1537,7 @@ mod tests {
                 ],
             ),
             source_addr(),
+            &mib_resolver(),
         );
         assert!(matches!(
             result,
@@ -1422,6 +1566,7 @@ mod tests {
                 ],
             ),
             source_addr(),
+            &mib_resolver(),
         )
         .unwrap();
 
@@ -1442,6 +1587,7 @@ mod tests {
                 vec![varbind(&[1, 3, 6, 1, 2, 1, 1, 1, 0], null())],
             ),
             source_addr(),
+            &mib_resolver(),
         );
         assert!(matches!(
             result,
@@ -1453,13 +1599,13 @@ mod tests {
     fn test_parse_trailing_data_rejected() {
         let mut data = v2c_notification(PduType::TrapV2).to_vec();
         data.push(0);
-        let result = parse_snmp_trap(&Bytes::from(data), source_addr());
+        let result = parse_snmp_trap(&Bytes::from(data), source_addr(), &mib_resolver());
         assert!(matches!(result, Err(ParseError::TrailingData(1))));
     }
 
     #[test]
     fn test_parse_v3_rejected() {
-        let error = parse_snmp_trap(&v3_trap(), source_addr()).unwrap_err();
+        let error = parse_snmp_trap(&v3_trap(), source_addr(), &mib_resolver()).unwrap_err();
         assert!(matches!(error, ParseError::UnsupportedVersion(_)));
         assert_eq!(error.error_code(), "unsupported_version");
     }
@@ -1467,16 +1613,45 @@ mod tests {
     #[test]
     fn test_parse_invalid_data() {
         let data = Bytes::from("invalid data");
-        let result = parse_snmp_trap(&data, source_addr());
+        let result = parse_snmp_trap(&data, source_addr(), &mib_resolver());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_empty_data() {
         let data = Bytes::from("");
-        let result = parse_snmp_trap(&data, source_addr());
+        let result = parse_snmp_trap(&data, source_addr(), &mib_resolver());
         assert!(result.is_err());
     }
+
+    const TEST_MIB: &str = r#"
+TEST-MIB DEFINITIONS ::= BEGIN
+
+IMPORTS
+    enterprises, OBJECT-TYPE, NOTIFICATION-TYPE
+        FROM SNMPv2-SMI;
+
+testRoot OBJECT IDENTIFIER ::= { enterprises 8072 }
+testNotifications OBJECT IDENTIFIER ::= { testRoot 2 }
+testNotificationPrefix OBJECT IDENTIFIER ::= { testNotifications 3 }
+testSpecificNotifications OBJECT IDENTIFIER ::= { testNotificationPrefix 0 }
+
+testTrap NOTIFICATION-TYPE
+    OBJECTS { testValue }
+    STATUS current
+    DESCRIPTION "A test notification."
+    ::= { testSpecificNotifications 1 }
+
+testObjects OBJECT IDENTIFIER ::= { testNotifications 4 }
+testValue OBJECT-TYPE
+    SYNTAX Integer32
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "A test value."
+    ::= { testObjects 1 }
+
+END
+"#;
 
     #[test]
     fn test_parse_reports_malformed_pdus_with_valid_communities_as_malformed() {
@@ -1487,7 +1662,11 @@ mod tests {
         pdu.push(0xff);
         message.extend(encode_tlv(0xa7, &pdu));
 
-        let result = parse_snmp_trap(&Bytes::from(encode_sequence(&message)), source_addr());
+        let result = parse_snmp_trap(
+            &Bytes::from(encode_sequence(&message)),
+            source_addr(),
+            &mib_resolver(),
+        );
         assert!(
             matches!(result, Err(ParseError::MalformedMessage(_))),
             "expected a malformed-message error, got {result:?}"
@@ -1503,7 +1682,7 @@ mod tests {
             notification_varbinds(),
         );
 
-        let result = parse_snmp_trap(&data, source_addr());
+        let result = parse_snmp_trap(&data, source_addr(), &mib_resolver());
         assert!(matches!(result, Err(ParseError::InvalidCommunity)));
     }
 
@@ -1557,7 +1736,7 @@ mod tests {
             ],
         );
 
-        let parsed = parse_snmp_trap(&request, source_addr()).unwrap();
+        let parsed = parse_snmp_trap(&request, source_addr(), &mib_resolver()).unwrap();
         let response = parsed.response.expect("inform should produce a response");
 
         assert_eq!(varbind_list_bytes(&response), varbind_list_bytes(&request));
@@ -1592,8 +1771,12 @@ mod tests {
             encode_tlv(0x65, &[0x02]),
         ));
 
-        let parsed =
-            parse_snmp_trap(&v2c_message(PduType::TrapV2, 1, varbinds), source_addr()).unwrap();
+        let parsed = parse_snmp_trap(
+            &v2c_message(PduType::TrapV2, 1, varbinds),
+            source_addr(),
+            &mib_resolver(),
+        )
+        .unwrap();
 
         let varbinds = parsed.events[0].as_log()["varbinds"].as_array().unwrap();
         let field = |index: usize, name: &str| varbinds[index].get(path!(name)).cloned();
@@ -1727,8 +1910,12 @@ mod tests {
         varbinds.push(varbind(&[1, 3, 6, 1, 4, 1, 1, 1], octet_string(&[])));
         varbinds.push(varbind(&[1, 3, 6, 1, 4, 1, 1, 2], null()));
 
-        let parsed =
-            parse_snmp_trap(&v2c_message(PduType::TrapV2, 1, varbinds), source_addr()).unwrap();
+        let parsed = parse_snmp_trap(
+            &v2c_message(PduType::TrapV2, 1, varbinds),
+            source_addr(),
+            &mib_resolver(),
+        )
+        .unwrap();
 
         let varbinds = parsed.events[0].as_log()["varbinds"].as_array().unwrap();
         let field = |index: usize, name: &str| varbinds[index].get(path!(name)).cloned();
@@ -1783,6 +1970,7 @@ mod tests {
                 assert_well_formed(parse_snmp_trap(
                     &Bytes::from(data),
                     source_addr(),
+                    &MibResolver::from_str(TEST_MIB)
                 ));
             }
 
@@ -1805,7 +1993,36 @@ mod tests {
                 assert_well_formed(parse_snmp_trap(
                     &Bytes::from(data),
                     source_addr(),
+                    &MibResolver::from_str(TEST_MIB)
                 ));
+            }
+
+            #[test]
+            fn arbitrary_mib_text_never_panics(
+                tokens in proptest::collection::vec(
+                    prop_oneof![
+                        Just("::=".to_string()),
+                        Just("{".to_string()),
+                        Just("}".to_string()),
+                        Just("(".to_string()),
+                        Just(")".to_string()),
+                        Just("OBJECT IDENTIFIER".to_string()),
+                        Just("OBJECT-TYPE".to_string()),
+                        Just("TRAP-TYPE".to_string()),
+                        Just("ENTERPRISE".to_string()),
+                        Just("IMPORTS".to_string()),
+                        Just("FROM".to_string()),
+                        Just("DEFINITIONS".to_string()),
+                        Just("--".to_string()),
+                        Just("\"".to_string()),
+                        "[a-zA-Z][a-zA-Z0-9-]{0,8}",
+                        "[0-9]{1,11}",
+                    ],
+                    0..64,
+                ),
+            ) {
+                let resolver = MibResolver::from_str(&tokens.join(" "));
+                let _ = resolver.resolve("1.3.6.1.4.1.1.1.0");
             }
         }
     }

@@ -460,6 +460,7 @@ urls: {
 	rfc_2064:                                   "\(vector_repo)/blob/master/rfcs/2020-03-17-2064-event-driven-observability.md"
 	rfc_2136:                                   "https://tools.ietf.org/html/rfc2136"
 	rfc_2460:                                   "https://tools.ietf.org/html/rfc2460"
+	rfc_2578:                                   "https://www.rfc-editor.org/rfc/rfc2578.html"
 	rfc_2822:                                   "https://tools.ietf.org/html/rfc2822#section-3.3"
 	rfc_3339:                                   "https://tools.ietf.org/html/rfc3339"
 	rfc_3414:                                   "https://www.rfc-editor.org/rfc/rfc3414.html"
