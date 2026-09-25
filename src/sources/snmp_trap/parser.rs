@@ -9,7 +9,10 @@ use snmp_parser::{
     },
 };
 use std::net::SocketAddr;
-use vector_lib::event::{Event, LogEvent};
+use vector_lib::{
+    event::{Event, LogEvent},
+    lookup::event_path,
+};
 
 use super::mib::{MibResolver, OidResolution};
 
@@ -137,20 +140,32 @@ fn parse_v1_trap(
                 ));
             }
 
-            log.insert("snmp_version", "1");
-            log.insert("pdu_type", "trap_v1");
-            log.insert("source_address", source_addr.to_string());
-            log.insert("community", message.community);
-            log.insert("enterprise_oid", enterprise_oid.as_str());
+            log.insert(event_path!("snmp_version"), "1");
+            log.insert(event_path!("pdu_type"), "trap_v1");
+            log.insert(event_path!("source_address"), source_addr.to_string());
+            log.insert(event_path!("community"), message.community);
+            log.insert(event_path!("enterprise_oid"), enterprise_oid.as_str());
             insert_oid_resolution(&mut log, "enterprise_oid", &enterprise_oid, mib_resolver);
-            log.insert("agent_address", format_network_address(trap.agent_addr));
-            log.insert("generic_trap", generic_trap as i64);
-            log.insert("generic_trap_name", trap_type_name(generic_trap));
-            log.insert("specific_trap", trap.specific_trap as i64);
-            log.insert("uptime", trap.timestamp as i64);
-            log.insert("varbinds", format_varbinds(&trap.var, mib_resolver));
             log.insert(
-                "message",
+                event_path!("agent_address"),
+                format_network_address(trap.agent_addr),
+            );
+            log.insert(event_path!("generic_trap"), generic_trap as i64);
+            log.insert(
+                event_path!("generic_trap_name"),
+                trap_type_name(generic_trap),
+            );
+            log.insert(event_path!("specific_trap"), trap.specific_trap as i64);
+            let trap_oid = v1_trap_oid(&enterprise_oid, generic_trap, trap.specific_trap);
+            log.insert(event_path!("trap_oid"), trap_oid.as_str());
+            insert_oid_resolution(&mut log, "trap_oid", &trap_oid, mib_resolver);
+            log.insert(event_path!("uptime"), trap.timestamp as i64);
+            log.insert(
+                event_path!("varbinds"),
+                format_varbinds(&trap.var, mib_resolver),
+            );
+            log.insert(
+                event_path!("message"),
                 format!(
                     "SNMPv1 trap from {} ({}): {}",
                     source_addr,
@@ -187,17 +202,20 @@ fn parse_v2c_notification(
             let mut log = LogEvent::default();
             let (uptime, trap_oid) = validate_v2c_notification_varbinds(pdu)?;
 
-            log.insert("snmp_version", "2c");
-            log.insert("pdu_type", notification_kind);
-            log.insert("source_address", source_addr.to_string());
-            log.insert("community", message.community.as_str());
-            log.insert("request_id", request_id);
-            log.insert("uptime", uptime);
-            log.insert("trap_oid", trap_oid.clone());
+            log.insert(event_path!("snmp_version"), "2c");
+            log.insert(event_path!("pdu_type"), notification_kind);
+            log.insert(event_path!("source_address"), source_addr.to_string());
+            log.insert(event_path!("community"), message.community.as_str());
+            log.insert(event_path!("request_id"), request_id);
+            log.insert(event_path!("uptime"), uptime);
+            log.insert(event_path!("trap_oid"), trap_oid.clone());
             insert_oid_resolution(&mut log, "trap_oid", &trap_oid, mib_resolver);
-            log.insert("varbinds", format_varbinds(&pdu.var, mib_resolver));
             log.insert(
-                "message",
+                event_path!("varbinds"),
+                format_varbinds(&pdu.var, mib_resolver),
+            );
+            log.insert(
+                event_path!("message"),
                 format!(
                     "SNMPv2c {} from {}: {}",
                     if pdu.pdu_type == PduType::InformRequest {
@@ -506,16 +524,16 @@ struct FormattedVarbindValue {
 fn insert_oid_resolution(log: &mut LogEvent, prefix: &str, oid: &str, mib_resolver: &MibResolver) {
     if let Some(resolution) = mib_resolver.resolve(oid) {
         let field = format!("{prefix}_name");
-        log.insert(field.as_str(), resolution.name);
+        log.insert(event_path!(field.as_str()), resolution.name);
         if let Some(module) = resolution.module {
             let field = format!("{prefix}_module");
-            log.insert(field.as_str(), module);
+            log.insert(event_path!(field.as_str()), module);
         }
         let field = format!("{prefix}_symbol");
-        log.insert(field.as_str(), resolution.symbol);
+        log.insert(event_path!(field.as_str()), resolution.symbol);
         if let Some(instance) = resolution.instance {
             let field = format!("{prefix}_instance");
-            log.insert(field.as_str(), instance);
+            log.insert(event_path!(field.as_str()), instance);
         }
     }
 }
@@ -672,6 +690,16 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 fn format_network_address(value: NetworkAddress) -> String {
     match value {
         NetworkAddress::IPv4(ip) => ip.to_string(),
+    }
+}
+
+/// Translates SNMPv1 trap identification into an SNMPv2 `snmpTrapOID.0` value as described in
+/// RFC 3584 section 3.1.
+fn v1_trap_oid(enterprise_oid: &str, generic_trap: u8, specific_trap: u32) -> String {
+    if generic_trap == 6 {
+        format!("{enterprise_oid}.0.{specific_trap}")
+    } else {
+        format!("1.3.6.1.6.3.1.1.5.{}", generic_trap + 1)
     }
 }
 
@@ -870,7 +898,7 @@ mod tests {
     use super::*;
     use snmp_parser::snmp::{ErrorStatus, PduType};
     use std::net::{IpAddr, Ipv4Addr};
-    use vector_lib::event::Value;
+    use vector_lib::{event::Value, lookup::path};
 
     fn source_addr() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 1162)
@@ -1107,7 +1135,23 @@ mod tests {
         assert_eq!(log["agent_address"], Value::from("192.168.1.100"));
         assert_eq!(log["generic_trap"], Value::from(6));
         assert_eq!(log["generic_trap_name"], Value::from("enterpriseSpecific"));
+        assert_eq!(log["trap_oid"], Value::from("1.3.6.1.4.1.8072.2.3.0.1.0.1"));
         assert_eq!(log["uptime"], Value::from(123_456));
+    }
+
+    #[test]
+    fn test_parse_v1_generic_trap_translates_trap_oid() {
+        let parsed = parse_snmp_trap(
+            &v1_trap_with_generic_trap(integer(2)),
+            source_addr(),
+            &mib_resolver(),
+        )
+        .unwrap();
+
+        let log = parsed.events[0].as_log();
+        assert_eq!(log["generic_trap_name"], Value::from("linkDown"));
+        assert_eq!(log["trap_oid"], Value::from("1.3.6.1.6.3.1.1.5.3"));
+        assert_eq!(log["trap_oid_name"], Value::from("IF-MIB::linkDown"));
     }
 
     #[test]
@@ -1160,12 +1204,18 @@ mod tests {
         assert_eq!(log["request_id"], Value::from(42));
         assert_eq!(log["uptime"], Value::from(123_456));
         assert_eq!(log["trap_oid"], Value::from("1.3.6.1.4.1.8072.2.3.0.1"));
-        assert!(log.get("trap_oid_name").is_none());
+        assert!(log.get(event_path!("trap_oid_name")).is_none());
 
         let varbinds = log["varbinds"].as_array().unwrap();
         assert_eq!(varbinds.len(), 3);
-        assert_eq!(varbinds[0].get("type").unwrap(), &Value::from("timeticks"));
-        assert_eq!(varbinds[2].get("type").unwrap(), &Value::from("integer"));
+        assert_eq!(
+            varbinds[0].get(path!("type")).unwrap(),
+            &Value::from("timeticks")
+        );
+        assert_eq!(
+            varbinds[2].get(path!("type")).unwrap(),
+            &Value::from("integer")
+        );
     }
 
     #[test]
@@ -1181,18 +1231,21 @@ mod tests {
 
         let varbinds = log["varbinds"].as_array().unwrap();
         assert_eq!(
-            varbinds[0].get("oid_name").unwrap(),
+            varbinds[0].get(path!("oid_name")).unwrap(),
             &Value::from("SNMPv2-MIB::sysUpTime.0")
         );
         assert_eq!(
-            varbinds[1].get("value_oid_name").unwrap(),
+            varbinds[1].get(path!("value_oid_name")).unwrap(),
             &Value::from("TEST-MIB::testTrap")
         );
         assert_eq!(
-            varbinds[2].get("oid_name").unwrap(),
+            varbinds[2].get(path!("oid_name")).unwrap(),
             &Value::from("TEST-MIB::testValue.0")
         );
-        assert_eq!(varbinds[2].get("oid_instance").unwrap(), &Value::from("0"));
+        assert_eq!(
+            varbinds[2].get(path!("oid_instance")).unwrap(),
+            &Value::from("0")
+        );
     }
 
     #[test]
@@ -1340,15 +1393,15 @@ mod tests {
 
         let varbinds = parsed.events[0].as_log()["varbinds"].as_array().unwrap();
         assert_eq!(
-            varbinds[2].get("type").unwrap(),
+            varbinds[2].get(path!("type")).unwrap(),
             &Value::from("no_such_object")
         );
         assert_eq!(
-            varbinds[3].get("type").unwrap(),
+            varbinds[3].get(path!("type")).unwrap(),
             &Value::from("no_such_instance")
         );
         assert_eq!(
-            varbinds[4].get("type").unwrap(),
+            varbinds[4].get(path!("type")).unwrap(),
             &Value::from("end_of_mib_view")
         );
     }
@@ -1379,16 +1432,19 @@ mod tests {
 
         let varbinds = parsed.events[0].as_log()["varbinds"].as_array().unwrap();
         assert_eq!(
-            varbinds[2].get("value").unwrap(),
+            varbinds[2].get(path!("value")).unwrap(),
             &Value::from("001122aabbcc")
         );
         assert_eq!(
-            varbinds[2].get("value_bytes_hex").unwrap(),
+            varbinds[2].get(path!("value_bytes_hex")).unwrap(),
             &Value::from("001122aabbcc")
         );
-        assert_eq!(varbinds[3].get("value").unwrap(), &Value::from("dead"));
         assert_eq!(
-            varbinds[3].get("value_bytes_hex").unwrap(),
+            varbinds[3].get(path!("value")).unwrap(),
+            &Value::from("dead")
+        );
+        assert_eq!(
+            varbinds[3].get(path!("value_bytes_hex")).unwrap(),
             &Value::from("dead")
         );
     }

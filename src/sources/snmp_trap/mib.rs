@@ -43,11 +43,27 @@ struct MibFile {
     required: bool,
 }
 
+/// A reference to another OID value, qualified with the module it is expected to come from when
+/// that can be determined from the referencing module's own definitions or its `IMPORTS`.
+#[derive(Clone, Debug)]
+struct SymbolRef {
+    module: Option<String>,
+    name: String,
+}
+
 #[derive(Clone, Debug)]
 enum OidElement {
-    Symbol(String),
+    Symbol(SymbolRef),
     Number(u32),
     NamedNumber(String, u32),
+}
+
+/// Outcome of trying to resolve a definition against the symbols known so far.
+enum ElementResolution {
+    Resolved(Vec<u32>),
+    /// The definition is waiting for the symbol stored under this key to be resolved.
+    Waiting(String),
+    Invalid,
 }
 
 impl MibResolver {
@@ -172,21 +188,19 @@ impl MibResolver {
             return Some(resolution(symbol, None));
         }
 
-        self.names_by_oid
-            .range(..=oid.clone())
-            .rev()
-            .find_map(|(prefix, symbol)| {
-                if symbol.prefix_resolves && oid.starts_with(prefix) && oid.len() > prefix.len() {
-                    let instance = oid[prefix.len()..]
-                        .iter()
-                        .map(u32::to_string)
-                        .collect::<Vec<_>>()
-                        .join(".");
-                    Some(resolution(symbol, Some(instance)))
-                } else {
-                    None
-                }
+        // Walk the OID's own prefixes from longest to shortest so lookups stay proportional to the
+        // OID length rather than to the number of loaded definitions.
+        (1..oid.len()).rev().find_map(|prefix_len| {
+            let symbol = self.names_by_oid.get(&oid[..prefix_len])?;
+            symbol.prefix_resolves.then(|| {
+                let instance = oid[prefix_len..]
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                resolution(symbol, Some(instance))
             })
+        })
     }
 
     fn insert_builtin(&mut self, module: &str, name: &str, oid: &[u32], prefix_resolves: bool) {
@@ -204,64 +218,81 @@ impl MibResolver {
         &mut self,
         definitions: Vec<RawDefinition>,
     ) -> HashMap<String, Vec<RawDefinition>> {
-        let mut symbols = self.symbols_by_name();
-        let mut waiting_by_symbol: HashMap<String, Vec<RawDefinition>> = HashMap::new();
-        let mut ready_symbols = VecDeque::new();
+        let loaded_modules: HashSet<String> = definitions
+            .iter()
+            .filter_map(|definition| definition.module.clone())
+            .collect();
+        let mut state = ResolutionState {
+            symbols: self.symbols_by_name(),
+            loaded_modules,
+            waiting_by_symbol: HashMap::new(),
+            ready_symbols: VecDeque::new(),
+            strict: true,
+        };
 
         for definition in definitions {
-            self.resolve_or_queue_definition(
-                definition,
-                &mut symbols,
-                &mut waiting_by_symbol,
-                &mut ready_symbols,
-            );
+            self.resolve_or_queue_definition(definition, &mut state);
         }
+        self.drain_ready_symbols(&mut state);
 
-        while let Some(symbol) = ready_symbols.pop_front() {
-            let Some(waiting) = waiting_by_symbol.remove(&symbol) else {
+        // Some modules import a symbol from a module that does not actually define it. Retry
+        // whatever is still waiting while allowing references to fall back to any module.
+        state.strict = false;
+        let waiting: Vec<_> = std::mem::take(&mut state.waiting_by_symbol)
+            .into_values()
+            .flatten()
+            .collect();
+        for definition in waiting {
+            self.resolve_or_queue_definition(definition, &mut state);
+        }
+        self.drain_ready_symbols(&mut state);
+
+        state.waiting_by_symbol
+    }
+
+    fn drain_ready_symbols(&mut self, state: &mut ResolutionState) {
+        while let Some(symbol) = state.ready_symbols.pop_front() {
+            let Some(waiting) = state.waiting_by_symbol.remove(&symbol) else {
                 continue;
             };
 
             for definition in waiting {
-                self.resolve_or_queue_definition(
-                    definition,
-                    &mut symbols,
-                    &mut waiting_by_symbol,
-                    &mut ready_symbols,
-                );
+                self.resolve_or_queue_definition(definition, state);
             }
         }
-
-        waiting_by_symbol
     }
 
     fn resolve_or_queue_definition(
         &mut self,
         definition: RawDefinition,
-        symbols: &mut HashMap<String, Vec<u32>>,
-        waiting_by_symbol: &mut HashMap<String, Vec<RawDefinition>>,
-        ready_symbols: &mut VecDeque<String>,
+        state: &mut ResolutionState,
     ) {
-        if let Some(oid) = resolve_elements(&definition.elements, symbols) {
-            let symbol = MibSymbol {
-                module: definition.module.clone(),
-                name: definition.name.clone(),
-                prefix_resolves: definition.prefix_resolves,
-            };
-
-            symbols.insert(definition.name.clone(), oid.clone());
-            ready_symbols.push_back(definition.name.clone());
-            if let Some(module) = &definition.module {
-                let qualified_name = format!("{module}::{}", definition.name);
-                symbols.insert(qualified_name.clone(), oid.clone());
-                ready_symbols.push_back(qualified_name);
+        match state.resolve_elements(&definition.elements) {
+            ElementResolution::Resolved(oid) => {
+                state.symbols.insert(definition.name.clone(), oid.clone());
+                state.ready_symbols.push_back(definition.name.clone());
+                if let Some(module) = &definition.module {
+                    let qualified_name = qualified_name(module, &definition.name);
+                    state.symbols.insert(qualified_name.clone(), oid.clone());
+                    state.ready_symbols.push_back(qualified_name);
+                }
+                self.names_by_oid.insert(
+                    oid,
+                    MibSymbol {
+                        module: definition.module,
+                        name: definition.name,
+                        prefix_resolves: definition.prefix_resolves,
+                    },
+                );
             }
-            self.names_by_oid.insert(oid, symbol);
-        } else if let Some(symbol) = first_unresolved_symbol(&definition.elements, symbols) {
-            waiting_by_symbol
-                .entry(symbol)
-                .or_default()
-                .push(definition);
+            ElementResolution::Waiting(symbol) => {
+                state
+                    .waiting_by_symbol
+                    .entry(symbol)
+                    .or_default()
+                    .push(definition);
+            }
+            ElementResolution::Invalid => {}
         }
     }
 
@@ -270,7 +301,7 @@ impl MibResolver {
         for (oid, symbol) in &self.names_by_oid {
             symbols.insert(symbol.name.clone(), oid.clone());
             if let Some(module) = &symbol.module {
-                symbols.insert(format!("{module}::{}", symbol.name), oid.clone());
+                symbols.insert(qualified_name(module, &symbol.name), oid.clone());
             }
         }
         symbols
@@ -282,6 +313,79 @@ impl MibResolver {
         let _ = resolver.resolve_definitions(parse_definitions(contents));
         resolver
     }
+}
+
+struct ResolutionState {
+    symbols: HashMap<String, Vec<u32>>,
+    loaded_modules: HashSet<String>,
+    waiting_by_symbol: HashMap<String, Vec<RawDefinition>>,
+    ready_symbols: VecDeque<String>,
+    /// When set, a reference qualified with a loaded module only resolves against that module.
+    strict: bool,
+}
+
+impl ResolutionState {
+    /// Looks up a referenced symbol, returning the key to wait on when it is not yet known.
+    fn lookup(&self, symbol: &SymbolRef) -> Result<&Vec<u32>, String> {
+        if let Some(module) = &symbol.module {
+            let qualified = qualified_name(module, &symbol.name);
+            if let Some(oid) = self.symbols.get(&qualified) {
+                return Ok(oid);
+            }
+            // Only accept a same-named symbol from another module when the expected module is not
+            // being loaded at all (for example, SMIv1 imports from `RFC1155-SMI`).
+            if self.strict && self.loaded_modules.contains(module) {
+                return Err(qualified);
+            }
+        }
+
+        self.symbols
+            .get(&symbol.name)
+            .ok_or_else(|| symbol.name.clone())
+    }
+
+    fn resolve_elements(&self, elements: &[OidElement]) -> ElementResolution {
+        let mut oid = Vec::new();
+
+        for element in elements {
+            match element {
+                OidElement::Number(number) => oid.push(*number),
+                OidElement::Symbol(symbol) => {
+                    let resolved = match self.lookup(symbol) {
+                        Ok(resolved) => resolved,
+                        Err(key) => return ElementResolution::Waiting(key),
+                    };
+                    if oid.is_empty() || resolved.starts_with(&oid) {
+                        oid.clone_from(resolved);
+                    } else {
+                        return ElementResolution::Invalid;
+                    }
+                }
+                OidElement::NamedNumber(symbol, number) => {
+                    if oid.is_empty()
+                        && let Some(resolved) = self.symbols.get(symbol)
+                    {
+                        oid.clone_from(resolved);
+                        if oid.last() != Some(number) {
+                            oid.push(*number);
+                        }
+                    } else {
+                        oid.push(*number);
+                    }
+                }
+            }
+        }
+
+        if oid.is_empty() {
+            ElementResolution::Invalid
+        } else {
+            ElementResolution::Resolved(oid)
+        }
+    }
+}
+
+fn qualified_name(module: &str, name: &str) -> String {
+    format!("{module}::{name}")
 }
 
 fn mib_files(path: &Path) -> crate::Result<Vec<MibFile>> {
@@ -402,11 +506,9 @@ fn push_mib_file(
     }
 
     if files.len() >= MAX_MIB_FILE_COUNT {
-        return Err(format!(
-            "MIB path scan exceeded maximum file count of {}",
-            MAX_MIB_FILE_COUNT
-        )
-        .into());
+        return Err(
+            format!("MIB path scan exceeded maximum file count of {MAX_MIB_FILE_COUNT}").into(),
+        );
     }
 
     files.push(MibFile { path, required });
@@ -435,35 +537,145 @@ fn read_mib_file(path: &Path) -> crate::Result<String> {
         .into());
     }
 
-    fs::read_to_string(path)
-        .map_err(|error| format!("Failed to read MIB file {}: {error}", path.display()).into())
+    // Vendor MIBs frequently contain Latin-1 text in descriptions, so decode lossily instead of
+    // rejecting files that are not valid UTF-8.
+    let bytes = fs::read(path)
+        .map_err(|error| format!("Failed to read MIB file {}: {error}", path.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn parse_definitions(contents: &str) -> Vec<RawDefinition> {
     let tokens = tokenize(&strip_comments_and_strings(contents));
-    let module = module_name(&tokens);
-    let mut definitions = Vec::new();
 
+    // A file can contain several modules; each one starts with `<ModuleName> DEFINITIONS`.
+    let module_starts: Vec<usize> = tokens
+        .windows(2)
+        .enumerate()
+        .filter(|(_, window)| window[1] == "DEFINITIONS" && is_module_reference(&window[0]))
+        .map(|(index, _)| index)
+        .collect();
+
+    if module_starts.is_empty() {
+        return parse_module_definitions(None, &tokens);
+    }
+
+    module_starts
+        .iter()
+        .enumerate()
+        .flat_map(|(position, &start)| {
+            let end = module_starts
+                .get(position + 1)
+                .copied()
+                .unwrap_or(tokens.len());
+            parse_module_definitions(Some(tokens[start].clone()), &tokens[start..end])
+        })
+        .collect()
+}
+
+fn parse_module_definitions(module: Option<String>, tokens: &[String]) -> Vec<RawDefinition> {
+    let imports = module_imports(tokens);
+    let local_names: HashSet<&str> = (0..tokens.len())
+        .filter(|&index| {
+            is_value_name(&tokens[index]) && oid_definition(tokens, index + 1).is_some()
+        })
+        .map(|index| tokens[index].as_str())
+        .collect();
+    let scope = ModuleScope {
+        module: module.as_deref(),
+        imports: &imports,
+        local_names: &local_names,
+    };
+
+    let mut definitions = Vec::new();
     for index in 0..tokens.len().saturating_sub(1) {
-        if !is_identifier(&tokens[index]) {
+        if !is_value_name(&tokens[index]) {
             continue;
         }
 
-        let Some((width, prefix_resolves)) = oid_definition(&tokens, index + 1) else {
+        let Some(definition) = oid_definition(tokens, index + 1) else {
             continue;
         };
 
-        if let Some(elements) = assignment_elements(&tokens, index + 1 + width) {
+        let elements = match definition {
+            OidDefinition::Braced {
+                width,
+                prefix_resolves: _,
+            } => assignment_elements(tokens, index + 1 + width, &scope),
+            OidDefinition::TrapType => trap_type_elements(tokens, index + 2, &scope),
+        };
+
+        if let Some(elements) = elements {
             definitions.push(RawDefinition {
                 module: module.clone(),
                 name: tokens[index].clone(),
-                prefix_resolves,
+                prefix_resolves: matches!(
+                    definition,
+                    OidDefinition::Braced {
+                        prefix_resolves: true,
+                        ..
+                    }
+                ),
                 elements,
             });
         }
     }
 
     definitions
+}
+
+/// The information needed to qualify symbol references made inside one module.
+struct ModuleScope<'a> {
+    module: Option<&'a str>,
+    imports: &'a HashMap<String, String>,
+    local_names: &'a HashSet<&'a str>,
+}
+
+impl ModuleScope<'_> {
+    fn symbol_ref(&self, name: &str, explicit_module: Option<&str>) -> SymbolRef {
+        let module = explicit_module
+            .or_else(|| {
+                self.local_names
+                    .contains(name)
+                    .then_some(self.module)
+                    .flatten()
+            })
+            .or_else(|| self.imports.get(name).map(String::as_str));
+
+        SymbolRef {
+            module: module.map(str::to_string),
+            name: name.to_string(),
+        }
+    }
+}
+
+/// Maps each imported symbol to the module it is imported from.
+fn module_imports(tokens: &[String]) -> HashMap<String, String> {
+    let mut imports = HashMap::new();
+    let Some(start) = tokens.iter().position(|token| token == "IMPORTS") else {
+        return imports;
+    };
+
+    let mut pending = Vec::new();
+    let mut index = start + 1;
+    while let Some(token) = tokens.get(index) {
+        match token.as_str() {
+            ";" => break,
+            "FROM" => {
+                let Some(module) = tokens.get(index + 1) else {
+                    break;
+                };
+                for symbol in pending.drain(..) {
+                    imports.insert(symbol, module.clone());
+                }
+                index += 1;
+            }
+            "," => {}
+            _ => pending.push(token.clone()),
+        }
+        index += 1;
+    }
+
+    imports
 }
 
 fn strip_comments_and_strings(contents: &str) -> String {
@@ -473,9 +685,15 @@ fn strip_comments_and_strings(contents: &str) -> String {
     while let Some(character) = chars.next() {
         if character == '-' && chars.peek() == Some(&'-') {
             let _ = chars.next();
-            for comment_char in chars.by_ref() {
+            // ASN.1 comments end at the end of the line or at the next `--`.
+            while let Some(comment_char) = chars.next() {
                 if comment_char == '\n' {
                     output.push('\n');
+                    break;
+                }
+                if comment_char == '-' && chars.peek() == Some(&'-') {
+                    let _ = chars.next();
+                    output.push(' ');
                     break;
                 }
             }
@@ -525,30 +743,49 @@ fn tokenize(contents: &str) -> Vec<String> {
     tokens
 }
 
-fn module_name(tokens: &[String]) -> Option<String> {
-    tokens
-        .windows(2)
-        .find(|window| window[1] == "DEFINITIONS")
-        .map(|window| window[0].clone())
+#[derive(Clone, Copy, Debug)]
+enum OidDefinition {
+    /// A definition whose value is a braced OID, `::= { parent 1 }`, starting `width` tokens after
+    /// the definition name.
+    Braced { width: usize, prefix_resolves: bool },
+    /// An SMIv1 `TRAP-TYPE` definition, `ENTERPRISE parent ... ::= 1`.
+    TrapType,
 }
 
-fn oid_definition(tokens: &[String], index: usize) -> Option<(usize, bool)> {
+fn oid_definition(tokens: &[String], index: usize) -> Option<OidDefinition> {
     match tokens.get(index).map(String::as_str) {
-        Some("OBJECT-TYPE") => Some((1, true)),
-        Some("MODULE-IDENTITY" | "OBJECT-IDENTITY" | "NOTIFICATION-TYPE") => Some((1, false)),
+        Some("OBJECT-TYPE") => Some(OidDefinition::Braced {
+            width: 1,
+            prefix_resolves: true,
+        }),
+        Some("MODULE-IDENTITY" | "OBJECT-IDENTITY" | "NOTIFICATION-TYPE") => {
+            Some(OidDefinition::Braced {
+                width: 1,
+                prefix_resolves: false,
+            })
+        }
+        Some("TRAP-TYPE") => Some(OidDefinition::TrapType),
         Some("OBJECT")
             if tokens
                 .get(index + 1)
                 .is_some_and(|token| token == "IDENTIFIER") =>
         {
-            Some((2, false))
+            Some(OidDefinition::Braced {
+                width: 2,
+                prefix_resolves: false,
+            })
         }
         _ => None,
     }
 }
 
-fn assignment_elements(tokens: &[String], start: usize) -> Option<Vec<OidElement>> {
-    let assign_index = tokens[start..]
+fn assignment_elements(
+    tokens: &[String],
+    start: usize,
+    scope: &ModuleScope<'_>,
+) -> Option<Vec<OidElement>> {
+    let assign_index = tokens
+        .get(start..)?
         .iter()
         .position(|token| token == "::=")
         .map(|position| start + position)?;
@@ -562,12 +799,50 @@ fn assignment_elements(tokens: &[String], start: usize) -> Option<Vec<OidElement
         end += 1;
     }
 
-    parse_oid_elements(&tokens[assign_index + 2..end])
+    parse_oid_elements(tokens.get(assign_index + 2..end)?, scope)
 }
 
-fn parse_oid_elements(tokens: &[String]) -> Option<Vec<OidElement>> {
+/// Builds the RFC 3584 section 3 notification OID for an SMIv1 `TRAP-TYPE`:
+/// `<enterprise>.0.<specific-trap>`.
+fn trap_type_elements(
+    tokens: &[String],
+    start: usize,
+    scope: &ModuleScope<'_>,
+) -> Option<Vec<OidElement>> {
+    let assign_index = tokens
+        .get(start..)?
+        .iter()
+        .position(|token| token == "::=")
+        .map(|position| start + position)?;
+    let specific_trap = tokens.get(assign_index + 1)?.parse::<u32>().ok()?;
+
+    let clauses = &tokens[start..assign_index];
+    let enterprise_index = clauses.iter().position(|token| token == "ENTERPRISE")?;
+    let enterprise = clauses.get(enterprise_index + 1)?;
+    let enterprise = if enterprise == "{" {
+        let end = clauses[enterprise_index + 2..]
+            .iter()
+            .position(|token| token == "}")
+            .map(|position| enterprise_index + 2 + position)?;
+        parse_oid_elements(&clauses[enterprise_index + 2..end], scope)?
+    } else if is_value_name(enterprise) {
+        vec![OidElement::Symbol(scope.symbol_ref(enterprise, None))]
+    } else {
+        return None;
+    };
+
+    let mut elements = enterprise;
+    elements.push(OidElement::Number(0));
+    elements.push(OidElement::Number(specific_trap));
+    Some(elements)
+}
+
+fn parse_oid_elements(tokens: &[String], scope: &ModuleScope<'_>) -> Option<Vec<OidElement>> {
     let mut elements = Vec::new();
     let mut index = 0;
+    // A module reference such as `SNMPv2-SMI` in `{ SNMPv2-SMI::enterprises 1 }` qualifies the
+    // symbol that follows it.
+    let mut explicit_module = None;
 
     while index < tokens.len() {
         let token = &tokens[index];
@@ -585,86 +860,26 @@ fn parse_oid_elements(tokens: &[String]) -> Option<Vec<OidElement>> {
         {
             elements.push(OidElement::NamedNumber(token.clone(), number));
             index += 4;
-        } else if is_identifier(token) {
-            elements.push(OidElement::Symbol(token.clone()));
+        } else if is_module_reference(token) && explicit_module.is_none() {
+            explicit_module = Some(token.as_str());
+            index += 1;
+            continue;
+        } else if is_value_name(token) {
+            elements.push(OidElement::Symbol(
+                scope.symbol_ref(token, explicit_module.take()),
+            ));
             index += 1;
         } else {
             return None;
         }
-    }
 
-    Some(elements)
-}
-
-fn resolve_elements(
-    elements: &[OidElement],
-    symbols: &HashMap<String, Vec<u32>>,
-) -> Option<Vec<u32>> {
-    let mut oid = Vec::new();
-
-    for element in elements {
-        match element {
-            OidElement::Number(number) => oid.push(*number),
-            OidElement::Symbol(symbol) => {
-                if symbol.contains('-') && oid.is_empty() && !symbols.contains_key(symbol) {
-                    continue;
-                }
-
-                let resolved = symbols.get(symbol)?;
-                if oid.is_empty() || resolved.starts_with(&oid) {
-                    oid = resolved.clone();
-                } else {
-                    return None;
-                }
-            }
-            OidElement::NamedNumber(symbol, number) => {
-                if oid.is_empty() {
-                    if let Some(resolved) = symbols.get(symbol) {
-                        oid = resolved.clone();
-                        if oid.last() != Some(number) {
-                            oid.push(*number);
-                        }
-                    } else {
-                        oid.push(*number);
-                    }
-                } else {
-                    oid.push(*number);
-                }
-            }
+        if explicit_module.is_some() {
+            // A module reference must be immediately followed by the symbol it qualifies.
+            return None;
         }
     }
 
-    (!oid.is_empty()).then_some(oid)
-}
-
-fn first_unresolved_symbol(
-    elements: &[OidElement],
-    symbols: &HashMap<String, Vec<u32>>,
-) -> Option<String> {
-    let mut oid_is_empty = true;
-
-    for element in elements {
-        match element {
-            OidElement::Number(_) => {
-                oid_is_empty = false;
-            }
-            OidElement::Symbol(symbol) => {
-                if symbol.contains('-') && oid_is_empty && !symbols.contains_key(symbol) {
-                    continue;
-                }
-
-                if !symbols.contains_key(symbol) {
-                    return Some(symbol.clone());
-                }
-                oid_is_empty = false;
-            }
-            OidElement::NamedNumber(_, _) => {
-                oid_is_empty = false;
-            }
-        }
-    }
-
-    None
+    (explicit_module.is_none()).then_some(elements)
 }
 
 fn parse_numeric_oid(oid: &str) -> Option<Vec<u32>> {
@@ -680,7 +895,7 @@ fn parse_numeric_oid(oid: &str) -> Option<Vec<u32>> {
 
 fn resolution(symbol: &MibSymbol, instance: Option<String>) -> OidResolution {
     let name = if let Some(module) = &symbol.module {
-        format!("{module}::{}", symbol.name)
+        qualified_name(module, &symbol.name)
     } else {
         symbol.name.clone()
     };
@@ -698,11 +913,14 @@ fn resolution(symbol: &MibSymbol, instance: Option<String>) -> OidResolution {
     }
 }
 
-fn is_identifier(token: &str) -> bool {
-    token
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| byte.is_ascii_alphabetic())
+/// ASN.1 value references (OID names) start with a lowercase letter.
+fn is_value_name(token: &str) -> bool {
+    token.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+}
+
+/// ASN.1 module and type references start with an uppercase letter.
+fn is_module_reference(token: &str) -> bool {
+    token.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
 }
 
 #[cfg(test)]
@@ -1089,64 +1307,182 @@ END
     }
 
     #[test]
-    fn name_collision_last_write_wins() {
+    fn same_name_in_different_modules_resolves_both() {
         let temp_dir = tempfile::tempdir().unwrap();
-
-        // Both MIBs define "sharedName" but at different OID locations.
-        // The current implementation uses a global symbol map; the second
-        // file's definition overwrites the first. Pin this behavior.
-        fs::write(
-            temp_dir.path().join("FIRST-MIB.txt"),
-            r#"
-FIRST-MIB DEFINITIONS ::= BEGIN
-
-IMPORTS
-    enterprises
-        FROM SNMPv2-SMI;
-
-sharedName OBJECT IDENTIFIER ::= { enterprises 11111 }
-
-END
-"#,
-        )
-        .unwrap();
-
-        fs::write(
-            temp_dir.path().join("SECOND-MIB.txt"),
-            r#"
-SECOND-MIB DEFINITIONS ::= BEGIN
-
-IMPORTS
-    enterprises
-        FROM SNMPv2-SMI;
-
-sharedName OBJECT IDENTIFIER ::= { enterprises 22222 }
-
-END
-"#,
-        )
-        .unwrap();
+        for (module, number) in [("FIRST-MIB", 11111), ("SECOND-MIB", 22222)] {
+            fs::write(
+                temp_dir.path().join(format!("{module}.txt")),
+                format!(
+                    "{module} DEFINITIONS ::= BEGIN\n\
+                     IMPORTS enterprises FROM SNMPv2-SMI;\n\
+                     sharedName OBJECT IDENTIFIER ::= {{ enterprises {number} }}\n\
+                     childName OBJECT IDENTIFIER ::= {{ sharedName 1 }}\n\
+                     END\n"
+                ),
+            )
+            .unwrap();
+        }
 
         let resolver = MibResolver::from_paths(&[temp_dir.path().to_path_buf()]).unwrap();
 
-        // Both OIDs should resolve — the names_by_oid BTreeMap stores by OID,
-        // so both entries coexist even though the symbol map had a collision.
-        let r1 = resolver.resolve("1.3.6.1.4.1.11111");
-        let r2 = resolver.resolve("1.3.6.1.4.1.22222");
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.11111.1").unwrap().name,
+            "FIRST-MIB::childName"
+        );
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.22222.1").unwrap().name,
+            "SECOND-MIB::childName"
+        );
+    }
 
-        // At least one of them should resolve (the last one processed wins
-        // the symbol map, but both OID→symbol entries are inserted).
-        assert!(
-            r1.is_some() || r2.is_some(),
-            "at least one colliding definition must resolve"
+    #[test]
+    fn syntax_object_identifier_does_not_shadow_object_name() {
+        let resolver = MibResolver::from_str(
+            r#"
+PTR-MIB DEFINITIONS ::= BEGIN
+ptrRoot OBJECT IDENTIFIER ::= { enterprises 99 }
+ptrValue OBJECT-TYPE
+    SYNTAX OBJECT IDENTIFIER
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "An object whose syntax is an OID."
+    ::= { ptrRoot 1 }
+END
+"#,
         );
 
-        // Verify no panic when both are present
-        if let Some(r) = &r1 {
-            assert_eq!(r.symbol, "sharedName");
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.99.1.0").unwrap().name,
+            "PTR-MIB::ptrValue.0"
+        );
+    }
+
+    #[test]
+    fn waits_for_hyphenated_parent_defined_later() {
+        let resolver = MibResolver::from_str(
+            r#"
+HYPHEN-MIB DEFINITIONS ::= BEGIN
+childNode OBJECT IDENTIFIER ::= { acme-root 5 }
+acme-root OBJECT IDENTIFIER ::= { enterprises 77 }
+END
+"#,
+        );
+
+        assert!(resolver.resolve("5").is_none());
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.77.5").unwrap().name,
+            "HYPHEN-MIB::childNode"
+        );
+    }
+
+    #[test]
+    fn resolves_references_within_the_referencing_module() {
+        let resolver = MibResolver::from_str(
+            r#"
+FIRST-MIB DEFINITIONS ::= BEGIN
+firstThing OBJECT IDENTIFIER ::= { root 1 }
+root OBJECT IDENTIFIER ::= { enterprises 1 }
+END
+
+SECOND-MIB DEFINITIONS ::= BEGIN
+root OBJECT IDENTIFIER ::= { enterprises 2 }
+END
+
+THIRD-MIB DEFINITIONS ::= BEGIN
+IMPORTS root FROM FIRST-MIB;
+thirdThing OBJECT IDENTIFIER ::= { root 3 }
+END
+"#,
+        );
+
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.1.1").unwrap().name,
+            "FIRST-MIB::firstThing"
+        );
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.1.3").unwrap().name,
+            "THIRD-MIB::thirdThing"
+        );
+        assert!(resolver.resolve("1.3.6.1.4.1.2.1").is_none());
+    }
+
+    #[test]
+    fn resolves_smiv1_trap_type_definitions() {
+        let resolver = MibResolver::from_str(
+            r#"
+V1-MIB DEFINITIONS ::= BEGIN
+IMPORTS enterprises FROM RFC1155-SMI
+        TRAP-TYPE FROM RFC-1215;
+v1Root OBJECT IDENTIFIER ::= { enterprises 4 }
+v1Trap TRAP-TYPE
+    ENTERPRISE v1Root
+    VARIABLES { v1Root }
+    DESCRIPTION "An enterprise-specific trap."
+    ::= 7
+END
+"#,
+        );
+
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.4.0.7").unwrap().name,
+            "V1-MIB::v1Trap"
+        );
+    }
+
+    #[test]
+    fn comments_can_end_before_the_end_of_line() {
+        let resolver = MibResolver::from_str(
+            "COMMENT-MIB DEFINITIONS ::= BEGIN\n\
+             commentRoot OBJECT IDENTIFIER -- inline -- ::= { enterprises 6 }\n\
+             END\n",
+        );
+
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.6").unwrap().name,
+            "COMMENT-MIB::commentRoot"
+        );
+    }
+
+    #[test]
+    fn loads_mib_files_that_are_not_utf8() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mib_path = temp_dir.path().join("LATIN1-MIB.txt");
+        let mut contents =
+            b"LATIN1-MIB DEFINITIONS ::= BEGIN\nlatinRoot OBJECT IDENTIFIER ::= { enterprises 5 }\n-- caf"
+                .to_vec();
+        contents.push(0xe9);
+        contents.extend_from_slice(b"\nEND\n");
+        fs::write(&mib_path, contents).unwrap();
+
+        let resolver = MibResolver::from_paths(&[mib_path]).unwrap();
+
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.5").unwrap().name,
+            "LATIN1-MIB::latinRoot"
+        );
+    }
+
+    #[test]
+    fn prefix_lookup_does_not_scan_unrelated_definitions() {
+        let mut contents = String::from(
+            "BULK-MIB DEFINITIONS ::= BEGIN\nbulkRoot OBJECT IDENTIFIER ::= { enterprises 3 }\n",
+        );
+        for index in 0..50_000 {
+            contents.push_str(&format!(
+                "bulk{index} OBJECT IDENTIFIER ::= {{ bulkRoot {index} }}\n"
+            ));
         }
-        if let Some(r) = &r2 {
-            assert_eq!(r.symbol, "sharedName");
+        contents.push_str("END\n");
+        let resolver = MibResolver::from_str(&contents);
+
+        let started = std::time::Instant::now();
+        for _ in 0..10_000 {
+            assert!(resolver.resolve("1.3.6.1.4.1.3.99999999.1").is_none());
         }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "unresolved lookups took {:?}",
+            started.elapsed()
+        );
     }
 }

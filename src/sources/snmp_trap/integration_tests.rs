@@ -1,16 +1,18 @@
 #![cfg(feature = "snmp-trap-integration-tests")]
 
 use std::{
-    fs,
     net::SocketAddr,
     path::PathBuf,
     process::{Command, Output},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use futures::{Stream, StreamExt};
 use tokio::{task::JoinHandle, time::Instant};
-use vector_lib::event::{Event, LogEvent, Value};
+use vector_lib::{
+    event::{Event, LogEvent, Value},
+    lookup::path,
+};
 
 use super::SnmpTrapConfig;
 use crate::{
@@ -85,8 +87,6 @@ async fn start_source() -> RunningSource {
     let source = config.build(context).await.unwrap();
     let task = tokio::spawn(source);
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
     RunningSource {
         address,
         events: Box::new(events),
@@ -114,26 +114,12 @@ fn run_net_snmp(command: &str, args: &[String]) -> Output {
             )
         });
 
-    let persistent_dir = std::env::temp_dir()
-        .join("vector-snmp-trap-integration")
-        .join(format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time should be after the Unix epoch")
-                .as_nanos()
-        ));
-    fs::create_dir_all(&persistent_dir).unwrap_or_else(|error| {
-        panic!(
-            "failed to create Net-SNMP persistent directory {}: {error}",
-            persistent_dir.display()
-        )
-    });
+    let persistent_dir = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("failed to create Net-SNMP persistent directory: {error}"));
 
     let output = Command::new(command)
         .env("MIBS", "")
-        .env("SNMP_PERSISTENT_DIR", &persistent_dir)
+        .env("SNMP_PERSISTENT_DIR", persistent_dir.path())
         .args(args)
         .output()
         .unwrap_or_else(|error| panic!("failed to execute {command}: {error}"));
@@ -163,14 +149,17 @@ fn varbind<'a>(log: &'a LogEvent, oid: &str) -> &'a Value {
         .as_array()
         .expect("varbinds should be an array")
         .iter()
-        .find(|varbind| varbind.get("oid") == Some(&Value::from(oid)))
+        .find(|varbind| varbind.get(path!("oid")) == Some(&Value::from(oid)))
         .unwrap_or_else(|| panic!("missing varbind for OID {oid}"))
 }
 
 fn assert_varbind(log: &LogEvent, oid: &str, value_type: &str, value: &str) {
     let varbind = varbind(log, oid);
-    assert_eq!(varbind.get("type").unwrap(), &Value::from(value_type));
-    assert_eq!(varbind.get("value").unwrap(), &Value::from(value));
+    assert_eq!(
+        varbind.get(path!("type")).unwrap(),
+        &Value::from(value_type)
+    );
+    assert_eq!(varbind.get(path!("value")).unwrap(), &Value::from(value));
 }
 
 #[tokio::test]
@@ -216,21 +205,21 @@ async fn net_snmp_v2c_trap_is_ingested_and_resolved() {
 
     let value = varbind(&log, VALUE_OID_NO_DOT);
     assert_eq!(
-        value.get("oid_name").unwrap(),
+        value.get(path!("oid_name")).unwrap(),
         &Value::from("VECTOR-TEST-MIB::vectorTestValue.0")
     );
-    assert_eq!(value.get("value").unwrap(), &Value::from("7"));
+    assert_eq!(value.get(path!("value")).unwrap(), &Value::from("7"));
 
     let text = varbind(&log, TEXT_OID_NO_DOT);
     assert_eq!(
-        text.get("value").unwrap(),
+        text.get(path!("value")).unwrap(),
         &Value::from("hello from net-snmp")
     );
 
     let bytes = varbind(&log, BYTES_OID_NO_DOT);
-    assert_eq!(bytes.get("value").unwrap(), &Value::from("deadbeef"));
+    assert_eq!(bytes.get(path!("value")).unwrap(), &Value::from("deadbeef"));
     assert_eq!(
-        bytes.get("value_bytes_hex").unwrap(),
+        bytes.get(path!("value_bytes_hex")).unwrap(),
         &Value::from("deadbeef")
     );
 
@@ -303,11 +292,11 @@ async fn net_snmp_v2c_trap_decodes_common_varbind_types() {
 
     let decimal_bytes = varbind(&log, DECIMAL_BYTES_OID_NO_DOT);
     assert_eq!(
-        decimal_bytes.get("value").unwrap(),
+        decimal_bytes.get(path!("value")).unwrap(),
         &Value::from("deadbeef")
     );
     assert_eq!(
-        decimal_bytes.get("value_bytes_hex").unwrap(),
+        decimal_bytes.get(path!("value_bytes_hex")).unwrap(),
         &Value::from("deadbeef")
     );
 
@@ -441,10 +430,10 @@ async fn net_snmp_v1_enterprise_specific_trap_is_ingested() {
 
     let value = varbind(&log, VALUE_OID_NO_DOT);
     assert_eq!(
-        value.get("oid_name").unwrap(),
+        value.get(path!("oid_name")).unwrap(),
         &Value::from("VECTOR-TEST-MIB::vectorTestValue.0")
     );
-    assert_eq!(value.get("value").unwrap(), &Value::from("11"));
+    assert_eq!(value.get(path!("value")).unwrap(), &Value::from("11"));
 
     source.stop().await;
 }

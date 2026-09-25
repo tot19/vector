@@ -2,6 +2,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use listenfd::ListenFd;
 use std::path::PathBuf;
+use tokio::net::UdpSocket;
 use vector_lib::{
     EstimatedJsonEncodedSizeOf,
     config::{LegacyKey, LogNamespace, log_schema},
@@ -159,11 +160,7 @@ impl SnmpTrapConfig {
             Kind::integer().or_undefined(),
             None,
         )
-        .with_event_field(
-            &owned_value_path!("trap_oid"),
-            Kind::bytes().or_undefined(),
-            None,
-        )
+        .with_event_field(&owned_value_path!("trap_oid"), Kind::bytes(), None)
         .with_event_field(
             &owned_value_path!("trap_oid_name"),
             Kind::bytes().or_undefined(),
@@ -219,8 +216,8 @@ impl Default for SnmpTrapConfig {
 }
 
 impl GenerateConfig for SnmpTrapConfig {
-    fn generate_config() -> toml::Value {
-        toml::Value::try_from(Self::default()).unwrap()
+    fn generate_config() -> serde_json::Value {
+        serde_json::to_value(Self::default()).unwrap()
     }
 }
 
@@ -230,9 +227,23 @@ impl SourceConfig for SnmpTrapConfig {
     async fn build(&self, cx: SourceContext) -> crate::Result<super::Source> {
         let log_namespace = cx.log_namespace(self.log_namespace);
         let host_key = self.host_key();
-        let mib_resolver = MibResolver::from_paths(&self.mib_paths)?;
+        // MIB loading can scan many files, so keep it off the async runtime threads.
+        let mib_paths = self.mib_paths.clone();
+        let mib_resolver =
+            tokio::task::spawn_blocking(move || MibResolver::from_paths(&mib_paths)).await??;
+
+        // Bind while building so that address conflicts fail the configuration load.
+        let socket = try_bind_udp_socket(self.address, ListenFd::from_env())
+            .await
+            .inspect_err(|error| {
+                emit!(SocketBindError {
+                    mode: SocketMode::Udp,
+                    error,
+                });
+            })?;
 
         Ok(Box::pin(snmp_trap_udp(
+            socket,
             self.address,
             self.receive_buffer_bytes,
             host_key,
@@ -262,7 +273,9 @@ impl SourceConfig for SnmpTrapConfig {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn snmp_trap_udp(
+    socket: UdpSocket,
     address: SocketListenAddr,
     receive_buffer_bytes: Option<usize>,
     host_key: Option<OwnedValuePath>,
@@ -272,15 +285,6 @@ async fn snmp_trap_udp(
     mut out: SourceSender,
 ) -> Result<(), ()> {
     let mut shutdown = shutdown;
-    let listenfd = ListenFd::from_env();
-    let socket = try_bind_udp_socket(address, listenfd)
-        .await
-        .map_err(|error| {
-            emit!(SocketBindError {
-                mode: SocketMode::Udp,
-                error: &error,
-            })
-        })?;
 
     if let Some(receive_buffer_bytes) = receive_buffer_bytes
         && let Err(error) = net::set_receive_buffer_size(&socket, receive_buffer_bytes)
@@ -401,7 +405,7 @@ mod tests {
         net::UdpSocket,
         time::{Duration, Instant, sleep, timeout},
     };
-    use vector_lib::event::LogEvent;
+    use vector_lib::{event::LogEvent, lookup::event_path};
 
     use crate::{
         config::ComponentKey,
@@ -435,6 +439,26 @@ mod tests {
 
         // Just verify we can create the source
         drop(source);
+    }
+
+    #[tokio::test]
+    async fn test_build_fails_when_address_is_in_use() {
+        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = SnmpTrapConfig {
+            address: SocketListenAddr::SocketAddr(occupied.local_addr().unwrap()),
+            receive_buffer_bytes: None,
+            host_key: None,
+            mib_paths: Vec::new(),
+            log_namespace: None,
+        };
+
+        let (tx, _rx) = SourceSender::new_test();
+        let result = SourceConfig::build(&config, SourceContext::new_test(tx, None)).await;
+
+        assert!(
+            result.is_err(),
+            "binding an in-use address must fail the build"
+        );
     }
 
     #[tokio::test]
@@ -506,7 +530,6 @@ mod tests {
 
             let source = config.build(context).await.unwrap();
             tokio::spawn(source);
-            sleep(Duration::from_millis(150)).await;
 
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             socket
@@ -553,7 +576,6 @@ mod tests {
 
         let source = config.build(context).await.unwrap();
         tokio::spawn(source);
-        sleep(Duration::from_millis(150)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket
@@ -568,7 +590,7 @@ mod tests {
         let log = event.as_log();
 
         assert_eq!(log["agent_host"], "127.0.0.1".into());
-        assert!(log.get("host").is_none());
+        assert!(log.get(event_path!("host")).is_none());
 
         shutdown
             .shutdown_all(Some(Instant::now() + Duration::from_millis(100)))
@@ -594,7 +616,6 @@ mod tests {
 
         let source = config.build(context).await.unwrap();
         tokio::spawn(source);
-        sleep(Duration::from_millis(150)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket
@@ -608,7 +629,7 @@ mod tests {
             .unwrap();
         let log = event.as_log();
 
-        assert!(log.get("host").is_none());
+        assert!(log.get(event_path!("host")).is_none());
 
         shutdown
             .shutdown_all(Some(Instant::now() + Duration::from_millis(100)))
@@ -634,7 +655,6 @@ mod tests {
 
         let source = config.build(context).await.unwrap();
         tokio::spawn(source);
-        sleep(Duration::from_millis(150)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket.connect(addr).await.unwrap();
@@ -689,7 +709,6 @@ mod tests {
 
         let source = config.build(context).await.unwrap();
         let source = tokio::spawn(source);
-        sleep(Duration::from_millis(150)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket.connect(addr).await.unwrap();
@@ -734,7 +753,6 @@ mod tests {
 
         let source = config.build(context).await.unwrap();
         let source = tokio::spawn(source);
-        sleep(Duration::from_millis(150)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket
@@ -774,7 +792,6 @@ mod tests {
 
         let source = config.build(context).await.unwrap();
         tokio::spawn(source);
-        sleep(Duration::from_millis(150)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket.connect(addr).await.unwrap();
@@ -832,7 +849,6 @@ mod tests {
 
         let source = config.build(context).await.unwrap();
         tokio::spawn(source);
-        sleep(Duration::from_millis(150)).await;
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket
@@ -851,14 +867,14 @@ mod tests {
 
         let varbinds = log["varbinds"].as_array().unwrap();
         assert_eq!(
-            varbinds[1].get("value_oid_name").unwrap(),
+            varbinds[1].get(path!("value_oid_name")).unwrap(),
             &"TEST-MIB::testTrap".into()
         );
         assert_eq!(
-            varbinds[2].get("oid_name").unwrap(),
+            varbinds[2].get(path!("oid_name")).unwrap(),
             &"TEST-MIB::testValue.0".into()
         );
-        assert_eq!(varbinds[2].get("oid_instance").unwrap(), &"0".into());
+        assert_eq!(varbinds[2].get(path!("oid_instance")).unwrap(), &"0".into());
 
         shutdown
             .shutdown_all(Some(Instant::now() + Duration::from_millis(100)))
@@ -884,14 +900,10 @@ mod tests {
 
         let source = config.build(context).await.unwrap();
         tokio::spawn(source);
-        sleep(Duration::from_millis(150)).await;
 
         // Send raw garbage that is not valid BER/SNMP
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket
-            .send_to(&[0xff; 64], addr)
-            .await
-            .unwrap();
+        socket.send_to(&[0xff; 64], addr).await.unwrap();
 
         // No event should arrive — the garbage must be silently dropped
         assert!(
@@ -937,7 +949,6 @@ mod tests {
 
         let source = config.build(context).await.unwrap();
         tokio::spawn(source);
-        sleep(Duration::from_millis(150)).await;
 
         // Minimal SNMPv3 message: SEQUENCE { INTEGER 3, ... }
         // version=3 is enough to trigger the v3 rejection path
@@ -946,10 +957,10 @@ mod tests {
             msg.extend(encode_integer(3)); // version = SNMPv3
             // msgGlobalData: SEQUENCE { msgID, maxSize, flags, securityModel }
             let mut global = Vec::new();
-            global.extend(encode_integer(1));      // msgID
-            global.extend(encode_integer(65507));   // msgMaxSize
+            global.extend(encode_integer(1)); // msgID
+            global.extend(encode_integer(65507)); // msgMaxSize
             global.extend(encode_tlv(0x04, &[0x04])); // msgFlags (reportable)
-            global.extend(encode_integer(3));       // USM security model
+            global.extend(encode_integer(3)); // USM security model
             msg.extend(encode_sequence(&global));
             // msgSecurityParameters: OCTET STRING (empty)
             msg.extend(encode_tlv(0x04, &[]));
@@ -959,10 +970,7 @@ mod tests {
         });
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket
-            .send_to(&snmpv3_packet, addr)
-            .await
-            .unwrap();
+        socket.send_to(&snmpv3_packet, addr).await.unwrap();
 
         // Should not produce an event (v3 is rejected)
         assert!(
