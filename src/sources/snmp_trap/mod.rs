@@ -26,6 +26,7 @@ use crate::{
     sources::util::net::{SocketListenAddr, try_bind_udp_socket},
 };
 
+mod display;
 mod mib;
 mod parser;
 
@@ -124,6 +125,7 @@ impl SnmpTrapConfig {
                     .with_known("oid_instance", Kind::bytes().or_undefined())
                     .with_known("type", Kind::bytes())
                     .with_known("value", Kind::bytes())
+                    .with_known("value_display", Kind::bytes())
                     .with_known("value_bytes_hex", Kind::bytes().or_undefined())
                     .with_known("value_oid_name", Kind::bytes().or_undefined())
                     .with_known("value_oid_module", Kind::bytes().or_undefined())

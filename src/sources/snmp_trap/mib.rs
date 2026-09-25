@@ -1,3 +1,4 @@
+use super::display::{BaseSyntax, ValueSyntax};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
@@ -9,6 +10,33 @@ const MAX_MIB_FILE_COUNT: usize = 16_384;
 const MAX_MIB_DIRECTORY_DEPTH: usize = 32;
 const MAX_MIB_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MIB_FILE_EXTENSIONS: &[&str] = &["mib", "my", "smi", "txt"];
+/// Textual conventions are resolved through at most this many levels of indirection.
+const MAX_TYPE_DEPTH: usize = 16;
+
+/// Core SNMPv2-TC (RFC 2579) textual conventions, used when SNMPv2-TC itself is not loaded, so that
+/// common types display like Net-SNMP, which always has this module loaded.
+const BUILTIN_TEXTUAL_CONVENTIONS: &str = r#"
+SNMPv2-TC DEFINITIONS ::= BEGIN
+DisplayString ::= TEXTUAL-CONVENTION DISPLAY-HINT "255a" SYNTAX OCTET STRING
+PhysAddress ::= TEXTUAL-CONVENTION DISPLAY-HINT "1x:" SYNTAX OCTET STRING
+MacAddress ::= TEXTUAL-CONVENTION DISPLAY-HINT "1x:" SYNTAX OCTET STRING
+TruthValue ::= TEXTUAL-CONVENTION SYNTAX INTEGER { true(1), false(2) }
+TestAndIncr ::= TEXTUAL-CONVENTION SYNTAX INTEGER
+AutonomousType ::= TEXTUAL-CONVENTION SYNTAX OBJECT IDENTIFIER
+InstancePointer ::= TEXTUAL-CONVENTION SYNTAX OBJECT IDENTIFIER
+VariablePointer ::= TEXTUAL-CONVENTION SYNTAX OBJECT IDENTIFIER
+RowPointer ::= TEXTUAL-CONVENTION SYNTAX OBJECT IDENTIFIER
+RowStatus ::= TEXTUAL-CONVENTION SYNTAX INTEGER { active(1), notInService(2), notReady(3),
+    createAndGo(4), createAndWait(5), destroy(6) }
+TimeStamp ::= TEXTUAL-CONVENTION SYNTAX TimeTicks
+TimeInterval ::= TEXTUAL-CONVENTION SYNTAX INTEGER
+DateAndTime ::= TEXTUAL-CONVENTION DISPLAY-HINT "2d-1d-1d,1d:1d:1d.1d,1a1d:1d" SYNTAX OCTET STRING
+StorageType ::= TEXTUAL-CONVENTION SYNTAX INTEGER { other(1), volatile(2), nonVolatile(3),
+    permanent(4), readOnly(5) }
+TDomain ::= TEXTUAL-CONVENTION SYNTAX OBJECT IDENTIFIER
+TAddress ::= TEXTUAL-CONVENTION SYNTAX OCTET STRING
+END
+"#;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct MibResolver {
@@ -23,6 +51,8 @@ struct MibSymbol {
     smiv2: bool,
     /// The modules the defining module imports from.
     dependencies: Arc<HashSet<String>>,
+    /// The value syntax of an `OBJECT-TYPE`.
+    syntax: Option<Arc<ValueSyntax>>,
 }
 
 impl MibSymbol {
@@ -54,6 +84,45 @@ struct RawDefinition {
     smiv2: bool,
     dependencies: Arc<HashSet<String>>,
     elements: Vec<OidElement>,
+    syntax: Option<SyntaxSpec>,
+    /// The `UNITS` of an `OBJECT-TYPE`.
+    units: Option<String>,
+}
+
+/// The definitions and type assignments parsed from MIB files.
+#[derive(Debug, Default)]
+struct ParsedMib {
+    definitions: Vec<RawDefinition>,
+    types: Vec<RawType>,
+}
+
+impl ParsedMib {
+    fn extend(&mut self, other: ParsedMib) {
+        self.definitions.extend(other.definitions);
+        self.types.extend(other.types);
+    }
+}
+
+/// A type assignment, such as a `TEXTUAL-CONVENTION` or `DisplayString ::= OCTET STRING`.
+#[derive(Clone, Debug)]
+struct RawType {
+    module: Option<String>,
+    name: String,
+    display_hint: Option<String>,
+    syntax: SyntaxSpec,
+}
+
+/// A `SYNTAX` clause before textual conventions are resolved.
+#[derive(Clone, Debug)]
+struct SyntaxSpec {
+    kind: SyntaxKind,
+    named_numbers: Vec<(i64, String)>,
+}
+
+#[derive(Clone, Debug)]
+enum SyntaxKind {
+    Base(BaseSyntax),
+    Type(SymbolRef),
 }
 
 #[derive(Clone, Debug)]
@@ -88,20 +157,20 @@ enum ElementResolution {
 impl MibResolver {
     pub(super) fn from_paths(paths: &[PathBuf]) -> crate::Result<Self> {
         let mut resolver = Self::with_builtin_symbols();
-        let mut definitions = Vec::new();
+        let mut parsed_mibs = ParsedMib::default();
 
         for path in paths {
             for file in mib_files(path)? {
                 match read_mib_file(&file.path) {
                     Ok(contents) => {
                         let parsed = parse_definitions(&contents);
-                        if parsed.is_empty() {
+                        if parsed.definitions.is_empty() && parsed.types.is_empty() {
                             warn!(
                                 message = "MIB file produced no definitions; OID names from this file will not resolve. Verify the file is a valid SMIv1/v2 module.",
                                 path = %file.path.display(),
                             );
                         }
-                        definitions.extend(parsed);
+                        parsed_mibs.extend(parsed);
                     }
                     Err(error) if file.required => return Err(error),
                     Err(error) => {
@@ -115,7 +184,7 @@ impl MibResolver {
             }
         }
 
-        let unresolved = resolver.resolve_definitions(definitions);
+        let unresolved = resolver.resolve_definitions(parsed_mibs);
         for (symbol, definitions) in unresolved {
             let total = definitions.len();
             let mut sample: Vec<String> = definitions
@@ -175,10 +244,21 @@ impl MibResolver {
     }
 
     pub(super) fn resolve(&self, oid: &str) -> Option<OidResolution> {
+        let (symbol, instance) = self.lookup(oid)?;
+        Some(resolution(symbol, instance))
+    }
+
+    /// Returns the value syntax of the object that an OID names, such as `IF-MIB::ifOperStatus`
+    /// for `1.3.6.1.2.1.2.2.1.8.3`.
+    pub(super) fn value_syntax(&self, oid: &str) -> Option<Arc<ValueSyntax>> {
+        self.lookup(oid)?.0.syntax.clone()
+    }
+
+    fn lookup(&self, oid: &str) -> Option<(&MibSymbol, Option<String>)> {
         let oid = parse_numeric_oid(oid)?;
 
         if let Some(symbol) = self.names_by_oid.get(&oid) {
-            return Some(resolution(symbol, None));
+            return Some((symbol, None));
         }
 
         // Like Net-SNMP, name the OID after its longest known prefix and append the remaining
@@ -191,7 +271,7 @@ impl MibResolver {
                 .map(u32::to_string)
                 .collect::<Vec<_>>()
                 .join(".");
-            Some(resolution(symbol, Some(instance)))
+            Some((symbol, Some(instance)))
         })
     }
 
@@ -203,19 +283,19 @@ impl MibResolver {
                 name: name.to_string(),
                 smiv2: true,
                 dependencies: Arc::default(),
+                syntax: None,
             },
         );
     }
 
-    fn resolve_definitions(
-        &mut self,
-        definitions: Vec<RawDefinition>,
-    ) -> HashMap<String, Vec<RawDefinition>> {
+    fn resolve_definitions(&mut self, parsed: ParsedMib) -> HashMap<String, Vec<RawDefinition>> {
+        let ParsedMib { definitions, types } = parsed;
         let loaded_modules: HashSet<String> = definitions
             .iter()
             .filter_map(|definition| definition.module.clone())
             .collect();
         let mut state = ResolutionState {
+            types: TypeTable::new(types),
             symbols: self.symbols_by_name(),
             loaded_modules,
             waiting_by_symbol: HashMap::new(),
@@ -269,11 +349,18 @@ impl MibResolver {
                     state.symbols.insert(qualified_name.clone(), oid.clone());
                     state.ready_symbols.push_back(qualified_name);
                 }
+                let syntax = definition.syntax.as_ref().map(|syntax| {
+                    Arc::new(ValueSyntax {
+                        units: definition.units.clone(),
+                        ..state.types.resolve(syntax)
+                    })
+                });
                 let symbol = MibSymbol {
                     module: definition.module,
                     name: definition.name,
                     smiv2: definition.smiv2,
                     dependencies: definition.dependencies,
+                    syntax,
                 };
                 let replace = self
                     .names_by_oid
@@ -314,6 +401,7 @@ impl MibResolver {
 }
 
 struct ResolutionState {
+    types: TypeTable,
     symbols: HashMap<String, Vec<u32>>,
     loaded_modules: HashSet<String>,
     waiting_by_symbol: HashMap<String, Vec<RawDefinition>>,
@@ -379,6 +467,78 @@ impl ResolutionState {
             ElementResolution::Invalid
         } else {
             ElementResolution::Resolved(oid)
+        }
+    }
+}
+
+/// Type assignments from all loaded MIBs, keyed by qualified and bare type name.
+struct TypeTable {
+    types: HashMap<String, RawType>,
+}
+
+impl TypeTable {
+    fn new(types: Vec<RawType>) -> Self {
+        let mut table = HashMap::new();
+        let builtin = parse_definitions(BUILTIN_TEXTUAL_CONVENTIONS).types;
+        for raw_type in builtin.into_iter().chain(types) {
+            // Bare names keep the first definition, while loaded modules replace the built-in
+            // SNMPv2-TC definitions under their qualified names.
+            table
+                .entry(raw_type.name.clone())
+                .or_insert_with(|| raw_type.clone());
+            if let Some(module) = &raw_type.module {
+                table.insert(qualified_name(module, &raw_type.name), raw_type);
+            }
+        }
+        Self { types: table }
+    }
+
+    fn get(&self, reference: &SymbolRef) -> Option<&RawType> {
+        reference
+            .module
+            .as_ref()
+            .and_then(|module| self.types.get(&qualified_name(module, &reference.name)))
+            .or_else(|| self.types.get(&reference.name))
+    }
+
+    /// Resolves textual conventions down to a base syntax. The outermost display hint and named
+    /// numbers win, so refinements such as `SYNTAX InetAddressType { ipv4(1) }` apply.
+    fn resolve(&self, syntax: &SyntaxSpec) -> ValueSyntax {
+        let mut named_numbers = syntax.named_numbers.clone();
+        let mut display_hint = None;
+        let mut kind = syntax.kind.clone();
+
+        for _ in 0..MAX_TYPE_DEPTH {
+            match kind {
+                SyntaxKind::Base(base) => {
+                    return ValueSyntax {
+                        base,
+                        named_numbers,
+                        display_hint,
+                        units: None,
+                    };
+                }
+                SyntaxKind::Type(reference) => {
+                    let Some(raw_type) = self.get(&reference) else {
+                        break;
+                    };
+                    if display_hint.is_none() {
+                        display_hint.clone_from(&raw_type.display_hint);
+                    }
+                    if named_numbers.is_empty() {
+                        named_numbers.clone_from(&raw_type.syntax.named_numbers);
+                    }
+                    kind = raw_type.syntax.kind.clone();
+                }
+            }
+        }
+
+        // Unknown or circular types are displayed from the value alone.
+        ValueSyntax {
+            base: BaseSyntax::Opaque,
+            named_numbers: Vec::new(),
+            display_hint: None,
+            units: None,
         }
     }
 }
@@ -543,8 +703,8 @@ fn read_mib_file(path: &Path) -> crate::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn parse_definitions(contents: &str) -> Vec<RawDefinition> {
-    let tokens = tokenize(&strip_comments_and_strings(contents));
+fn parse_definitions(contents: &str) -> ParsedMib {
+    let tokens = tokenize(contents);
 
     // A file can contain several modules; each one starts with `<ModuleName> DEFINITIONS`.
     let module_starts: Vec<usize> = tokens
@@ -558,20 +718,21 @@ fn parse_definitions(contents: &str) -> Vec<RawDefinition> {
         return parse_module_definitions(None, &tokens);
     }
 
-    module_starts
-        .iter()
-        .enumerate()
-        .flat_map(|(position, &start)| {
-            let end = module_starts
-                .get(position + 1)
-                .copied()
-                .unwrap_or(tokens.len());
-            parse_module_definitions(Some(tokens[start].clone()), &tokens[start..end])
-        })
-        .collect()
+    let mut parsed = ParsedMib::default();
+    for (position, &start) in module_starts.iter().enumerate() {
+        let end = module_starts
+            .get(position + 1)
+            .copied()
+            .unwrap_or(tokens.len());
+        parsed.extend(parse_module_definitions(
+            Some(tokens[start].clone()),
+            &tokens[start..end],
+        ));
+    }
+    parsed
 }
 
-fn parse_module_definitions(module: Option<String>, tokens: &[String]) -> Vec<RawDefinition> {
+fn parse_module_definitions(module: Option<String>, tokens: &[String]) -> ParsedMib {
     let imports = module_imports(tokens);
     let smiv2 = tokens.iter().any(|token| token == "MODULE-IDENTITY");
     let dependencies: Arc<HashSet<String>> = Arc::new(imports.values().cloned().collect());
@@ -581,10 +742,15 @@ fn parse_module_definitions(module: Option<String>, tokens: &[String]) -> Vec<Ra
         })
         .map(|index| tokens[index].as_str())
         .collect();
+    let local_types: HashSet<&str> = (0..tokens.len())
+        .filter(|&index| is_type_assignment(tokens, index))
+        .map(|index| tokens[index].as_str())
+        .collect();
     let scope = ModuleScope {
         module: module.as_deref(),
         imports: &imports,
         local_names: &local_names,
+        local_types: &local_types,
     };
 
     let mut definitions = Vec::new();
@@ -601,6 +767,13 @@ fn parse_module_definitions(module: Option<String>, tokens: &[String]) -> Vec<Ra
             OidDefinition::Braced => assignment_elements(tokens, index + 1, &scope),
             OidDefinition::TrapType => trap_type_elements(tokens, index + 1, &scope),
         };
+        let object_type = tokens[index + 1] == "OBJECT-TYPE";
+        let syntax = object_type
+            .then(|| object_type_syntax(tokens, index + 2, &scope))
+            .flatten();
+        let units = object_type
+            .then(|| object_type_units(tokens, index + 2))
+            .flatten();
 
         if let Some(elements) = elements {
             definitions.push(RawDefinition {
@@ -609,11 +782,167 @@ fn parse_module_definitions(module: Option<String>, tokens: &[String]) -> Vec<Ra
                 smiv2,
                 dependencies: Arc::clone(&dependencies),
                 elements,
+                syntax,
+                units,
             });
         }
     }
 
-    definitions
+    let types = (0..tokens.len())
+        .filter(|&index| is_type_assignment(tokens, index))
+        .filter_map(|index| type_assignment(tokens, index, module.as_deref(), &scope))
+        .collect();
+
+    ParsedMib { definitions, types }
+}
+
+/// Whether the token at `index` starts a type assignment such as `DisplayString ::= ...`.
+fn is_type_assignment(tokens: &[String], index: usize) -> bool {
+    is_module_reference(&tokens[index]) && tokens.get(index + 1).is_some_and(|token| token == "::=")
+}
+
+fn type_assignment(
+    tokens: &[String],
+    index: usize,
+    module: Option<&str>,
+    scope: &ModuleScope<'_>,
+) -> Option<RawType> {
+    let body = index + 2;
+    let (display_hint, syntax) = if tokens.get(body)? == "TEXTUAL-CONVENTION" {
+        let end = next_definition(tokens, body + 1);
+        let clauses = &tokens[body + 1..end];
+        let display_hint = clauses
+            .iter()
+            .position(|token| token == "DISPLAY-HINT")
+            .and_then(|position| clauses.get(position + 1))
+            .and_then(|token| string_token(token))
+            .map(str::to_string);
+        let syntax_index = clauses.iter().position(|token| token == "SYNTAX")?;
+        (
+            display_hint,
+            parse_syntax(clauses, syntax_index + 1, scope)?,
+        )
+    } else {
+        (None, parse_syntax(tokens, body, scope)?)
+    };
+
+    Some(RawType {
+        module: module.map(str::to_string),
+        name: tokens[index].clone(),
+        display_hint,
+        syntax,
+    })
+}
+
+/// Parses the `SYNTAX` clause of an `OBJECT-TYPE` whose clauses start at `start`.
+fn object_type_syntax(
+    tokens: &[String],
+    start: usize,
+    scope: &ModuleScope<'_>,
+) -> Option<SyntaxSpec> {
+    let end = tokens[start..]
+        .iter()
+        .position(|token| token == "::=")
+        .map_or(tokens.len(), |position| start + position);
+    let clauses = &tokens[start..end];
+    let syntax_index = clauses.iter().position(|token| token == "SYNTAX")?;
+    parse_syntax(clauses, syntax_index + 1, scope)
+}
+
+/// Returns the `UNITS` of an `OBJECT-TYPE` whose clauses start at `start`.
+fn object_type_units(tokens: &[String], start: usize) -> Option<String> {
+    let clauses = &tokens[start..next_definition(tokens, start)];
+    clauses
+        .iter()
+        .position(|token| token == "UNITS")
+        .and_then(|position| clauses.get(position + 1))
+        .and_then(|token| string_token(token))
+        .map(str::to_string)
+}
+
+/// Returns the index of the next `::=` assignment, which bounds the clauses of a macro such as
+/// `TEXTUAL-CONVENTION`.
+fn next_definition(tokens: &[String], start: usize) -> usize {
+    tokens[start..]
+        .iter()
+        .position(|token| token == "::=")
+        .map_or(tokens.len(), |position| start + position)
+}
+
+fn parse_syntax(tokens: &[String], start: usize, scope: &ModuleScope<'_>) -> Option<SyntaxSpec> {
+    let token = tokens.get(start)?.as_str();
+    let next = tokens.get(start + 1).map(String::as_str);
+    let (kind, rest) = match (token, next) {
+        ("INTEGER" | "Integer32", _) => (SyntaxKind::Base(BaseSyntax::Integer), start + 1),
+        ("Unsigned32" | "Gauge32" | "Gauge", _) => {
+            (SyntaxKind::Base(BaseSyntax::Unsigned), start + 1)
+        }
+        ("Counter32" | "Counter64" | "Counter", _) => {
+            (SyntaxKind::Base(BaseSyntax::Counter), start + 1)
+        }
+        ("TimeTicks", _) => (SyntaxKind::Base(BaseSyntax::TimeTicks), start + 1),
+        ("IpAddress", _) => (SyntaxKind::Base(BaseSyntax::IpAddress), start + 1),
+        ("NetworkAddress", _) => (SyntaxKind::Base(BaseSyntax::NetworkAddress), start + 1),
+        ("Opaque", _) => (SyntaxKind::Base(BaseSyntax::Opaque), start + 1),
+        ("BITS", _) => (SyntaxKind::Base(BaseSyntax::Bits), start + 1),
+        ("OCTET", Some("STRING")) => (SyntaxKind::Base(BaseSyntax::OctetString), start + 2),
+        ("OBJECT", Some("IDENTIFIER")) => {
+            (SyntaxKind::Base(BaseSyntax::ObjectIdentifier), start + 2)
+        }
+        ("SEQUENCE" | "CHOICE", _) => return None,
+        (token, Some(name))
+            if is_module_reference(token)
+                && is_module_reference(name)
+                && scope.is_module(token) =>
+        {
+            (
+                SyntaxKind::Type(scope.type_ref(name, Some(token))),
+                start + 2,
+            )
+        }
+        (token, _) if is_module_reference(token) => {
+            (SyntaxKind::Type(scope.type_ref(token, None)), start + 1)
+        }
+        _ => return None,
+    };
+
+    let named_numbers = if tokens.get(rest).is_some_and(|token| token == "{") {
+        parse_named_numbers(&tokens[rest + 1..])
+    } else {
+        Vec::new()
+    };
+
+    Some(SyntaxSpec {
+        kind,
+        named_numbers,
+    })
+}
+
+/// Parses `name(number), ...` up to the closing brace of an enumeration or BITS definition.
+fn parse_named_numbers(tokens: &[String]) -> Vec<(i64, String)> {
+    let mut named_numbers = Vec::new();
+    let mut index = 0;
+    while let Some(token) = tokens.get(index) {
+        if token == "}" {
+            break;
+        }
+        if is_value_name(token)
+            && tokens.get(index + 1).is_some_and(|token| token == "(")
+            && let Some(number) = tokens.get(index + 2).and_then(|token| token.parse().ok())
+            && tokens.get(index + 3).is_some_and(|token| token == ")")
+        {
+            named_numbers.push((number, token.clone()));
+            index += 4;
+        } else {
+            index += 1;
+        }
+    }
+    named_numbers
+}
+
+/// Returns the contents of a quoted string token.
+fn string_token(token: &str) -> Option<&str> {
+    token.strip_prefix('"')
 }
 
 /// The information needed to qualify symbol references made inside one module.
@@ -621,9 +950,31 @@ struct ModuleScope<'a> {
     module: Option<&'a str>,
     imports: &'a HashMap<String, String>,
     local_names: &'a HashSet<&'a str>,
+    local_types: &'a HashSet<&'a str>,
 }
 
 impl ModuleScope<'_> {
+    fn type_ref(&self, name: &str, explicit_module: Option<&str>) -> SymbolRef {
+        let module = explicit_module
+            .or_else(|| {
+                self.local_types
+                    .contains(name)
+                    .then_some(self.module)
+                    .flatten()
+            })
+            .or_else(|| self.imports.get(name).map(String::as_str));
+
+        SymbolRef {
+            module: module.map(str::to_string),
+            name: name.to_string(),
+        }
+    }
+
+    /// Whether a token names a module this module refers to, as in `SNMPv2-TC.DisplayString`.
+    fn is_module(&self, token: &str) -> bool {
+        self.module == Some(token) || self.imports.values().any(|module| module == token)
+    }
+
     fn symbol_ref(&self, name: &str, explicit_module: Option<&str>) -> SymbolRef {
         let module = explicit_module
             .or_else(|| {
@@ -671,8 +1022,11 @@ fn module_imports(tokens: &[String]) -> HashMap<String, String> {
     imports
 }
 
-fn strip_comments_and_strings(contents: &str) -> String {
-    let mut output = String::with_capacity(contents.len());
+/// Splits MIB source into tokens. Comments are dropped, and each quoted string becomes a single
+/// token that starts with `"` and holds the string's contents, so text inside descriptions is
+/// never mistaken for definitions.
+fn tokenize(contents: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
     let mut chars = contents.chars().peekable();
 
     while let Some(character) = chars.next() {
@@ -681,37 +1035,23 @@ fn strip_comments_and_strings(contents: &str) -> String {
             // ASN.1 comments end at the end of the line or at the next `--`.
             while let Some(comment_char) = chars.next() {
                 if comment_char == '\n' {
-                    output.push('\n');
                     break;
                 }
                 if comment_char == '-' && chars.peek() == Some(&'-') {
                     let _ = chars.next();
-                    output.push(' ');
                     break;
                 }
             }
         } else if character == '"' {
-            output.push(' ');
+            let mut token = String::from('"');
             for string_char in chars.by_ref() {
                 if string_char == '"' {
                     break;
                 }
+                token.push(string_char);
             }
-            output.push(' ');
-        } else {
-            output.push(character);
-        }
-    }
-
-    output
-}
-
-fn tokenize(contents: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut chars = contents.chars().peekable();
-
-    while let Some(character) = chars.next() {
-        if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+            tokens.push(token);
+        } else if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
             let mut token = String::from(character);
             while let Some(next) = chars.peek() {
                 if next.is_ascii_alphanumeric() || *next == '_' || *next == '-' {
@@ -1215,9 +1555,8 @@ END
     fn parse_returns_empty_for_non_mib_content() {
         let parsed = parse_definitions("this is just a README file, not a MIB module at all.\n");
         assert!(
-            parsed.is_empty(),
-            "expected no definitions from non-MIB text, got {} definition(s)",
-            parsed.len()
+            parsed.definitions.is_empty() && parsed.types.is_empty(),
+            "expected no definitions from non-MIB text, got {parsed:?}"
         );
     }
 
@@ -1795,6 +2134,267 @@ END
         assert_eq!(
             resolver.resolve("1.3.6.1.4.1.48.1.1.2.7").unwrap().name,
             "TABLE-MIB::oidColumn.7"
+        );
+    }
+
+    const SYNTAX_MIB: &str = r#"
+SYNTAX-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, Integer32, enterprises FROM SNMPv2-SMI
+    TEXTUAL-CONVENTION, DisplayString, MacAddress FROM SNMPv2-TC;
+
+syntaxMib MODULE-IDENTITY
+    LAST-UPDATED "202601010000Z"
+    ORGANIZATION "Example"
+    CONTACT-INFO "Example"
+    DESCRIPTION "SYNTAX \"quoted\" -- not a comment ::= { enterprises 1 }"
+    ::= { enterprises 49 }
+
+Status ::= TEXTUAL-CONVENTION
+    STATUS current
+    DESCRIPTION "Operational state."
+    SYNTAX INTEGER { up(1), down(2), unknown(-1) }
+
+Tenths ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "d-1"
+    STATUS current
+    DESCRIPTION "Tenths of a unit."
+    SYNTAX Integer32
+
+Label ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "255t"
+    STATUS current
+    DESCRIPTION "A label that refines DisplayString."
+    SYNTAX DisplayString
+
+LegacyString ::= OCTET STRING
+
+statusObject OBJECT-TYPE
+    SYNTAX Status
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Uses a local textual convention."
+    ::= { syntaxMib 1 }
+
+refinedStatus OBJECT-TYPE
+    SYNTAX Status { up(1) }
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Refines the enumeration."
+    ::= { syntaxMib 2 }
+
+temperature OBJECT-TYPE
+    SYNTAX Tenths
+    UNITS "degrees"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Uses a hinted integer with units."
+    ::= { syntaxMib 3 }
+
+macObject OBJECT-TYPE
+    SYNTAX MacAddress
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Uses a built-in SNMPv2-TC convention."
+    ::= { syntaxMib 4 }
+
+labelObject OBJECT-TYPE
+    SYNTAX Label (SIZE (0..32))
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "The outer display hint wins."
+    ::= { syntaxMib 5 }
+
+flags OBJECT-TYPE
+    SYNTAX BITS { first(0), second(1) }
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "BITS labels."
+    ::= { syntaxMib 6 }
+
+legacyObject OBJECT-TYPE
+    SYNTAX LegacyString
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "An SMIv1-style type assignment."
+    ::= { syntaxMib 7 }
+
+unknownType OBJECT-TYPE
+    SYNTAX NotDefinedAnywhere
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "An unresolvable type."
+    ::= { syntaxMib 8 }
+
+END
+"#;
+
+    fn syntax_of(resolver: &MibResolver, oid: &str) -> ValueSyntax {
+        resolver
+            .value_syntax(oid)
+            .map(|syntax| (*syntax).clone())
+            .unwrap_or_else(|| panic!("no syntax for {oid}"))
+    }
+
+    #[test]
+    fn resolves_object_syntax_through_textual_conventions() {
+        let resolver = MibResolver::from_str(SYNTAX_MIB);
+        let named = |pairs: &[(i64, &str)]| {
+            pairs
+                .iter()
+                .map(|(number, label)| (*number, (*label).to_string()))
+                .collect::<Vec<_>>()
+        };
+
+        let status = syntax_of(&resolver, "1.3.6.1.4.1.49.1.0");
+        assert_eq!(status.base, BaseSyntax::Integer);
+        assert_eq!(
+            status.named_numbers,
+            named(&[(1, "up"), (2, "down"), (-1, "unknown")])
+        );
+
+        let refined = syntax_of(&resolver, "1.3.6.1.4.1.49.2.0");
+        assert_eq!(refined.named_numbers, named(&[(1, "up")]));
+
+        let temperature = syntax_of(&resolver, "1.3.6.1.4.1.49.3.0");
+        assert_eq!(temperature.base, BaseSyntax::Integer);
+        assert_eq!(temperature.display_hint.as_deref(), Some("d-1"));
+        assert_eq!(temperature.units.as_deref(), Some("degrees"));
+
+        let mac = syntax_of(&resolver, "1.3.6.1.4.1.49.4.0");
+        assert_eq!(mac.base, BaseSyntax::OctetString);
+        assert_eq!(mac.display_hint.as_deref(), Some("1x:"));
+
+        let label = syntax_of(&resolver, "1.3.6.1.4.1.49.5.0");
+        assert_eq!(label.base, BaseSyntax::OctetString);
+        assert_eq!(label.display_hint.as_deref(), Some("255t"));
+
+        let flags = syntax_of(&resolver, "1.3.6.1.4.1.49.6.0");
+        assert_eq!(flags.base, BaseSyntax::Bits);
+        assert_eq!(flags.named_numbers, named(&[(0, "first"), (1, "second")]));
+
+        let legacy = syntax_of(&resolver, "1.3.6.1.4.1.49.7.0");
+        assert_eq!(legacy.base, BaseSyntax::OctetString);
+        assert_eq!(legacy.display_hint, None);
+
+        let unknown = syntax_of(&resolver, "1.3.6.1.4.1.49.8.0");
+        assert_eq!(unknown.base, BaseSyntax::Opaque);
+
+        // Only objects carry a syntax, and OIDs below a non-object have none.
+        assert!(resolver.value_syntax("1.3.6.1.4.1.49").is_none());
+        assert!(resolver.value_syntax("1.3.6.1.4.1.50.1").is_none());
+    }
+
+    #[test]
+    fn strings_in_descriptions_do_not_create_definitions() {
+        let resolver = MibResolver::from_str(SYNTAX_MIB);
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.1").unwrap().name,
+            "SNMPv2-SMI::enterprises.1"
+        );
+        assert_eq!(
+            resolver.resolve("1.3.6.1.4.1.49").unwrap().name,
+            "SYNTAX-MIB::syntaxMib"
+        );
+    }
+
+    #[test]
+    fn loaded_textual_conventions_replace_builtin_ones() {
+        let resolver = MibResolver::from_str(
+            r#"
+SNMPv2-TC DEFINITIONS ::= BEGIN
+MacAddress ::= TEXTUAL-CONVENTION
+    DISPLAY-HINT "1x-"
+    STATUS current
+    DESCRIPTION "Overridden for the test."
+    SYNTAX OCTET STRING (SIZE (6))
+END
+
+USER-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, enterprises FROM SNMPv2-SMI MacAddress FROM SNMPv2-TC;
+userMac OBJECT-TYPE
+    SYNTAX MacAddress
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "Uses the loaded convention."
+    ::= { enterprises 50 1 }
+END
+"#,
+        );
+
+        assert_eq!(
+            syntax_of(&resolver, "1.3.6.1.4.1.50.1.0")
+                .display_hint
+                .as_deref(),
+            Some("1x-")
+        );
+    }
+
+    #[test]
+    fn circular_textual_conventions_do_not_loop() {
+        let resolver = MibResolver::from_str(
+            r#"
+LOOP-MIB DEFINITIONS ::= BEGIN
+First ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "" SYNTAX Second
+Second ::= TEXTUAL-CONVENTION STATUS current DESCRIPTION "" SYNTAX First
+loopObject OBJECT-TYPE
+    SYNTAX First
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "A circular type."
+    ::= { enterprises 51 }
+END
+"#,
+        );
+
+        assert_eq!(
+            syntax_of(&resolver, "1.3.6.1.4.1.51.0").base,
+            BaseSyntax::Opaque
+        );
+    }
+
+    #[test]
+    fn resolves_application_types_tables_and_qualified_types() {
+        let resolver = MibResolver::from_str(
+            r#"
+TYPES-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, Unsigned32, Gauge32, enterprises FROM SNMPv2-SMI
+        DisplayString FROM SNMPv2-TC
+        NetworkAddress FROM RFC1155-SMI;
+unsignedObject OBJECT-TYPE SYNTAX Unsigned32 { low(1) } MAX-ACCESS read-only STATUS current DESCRIPTION "" ::= { enterprises 53 1 }
+gaugeObject OBJECT-TYPE SYNTAX Gauge32 MAX-ACCESS read-only STATUS current DESCRIPTION "" ::= { enterprises 53 2 }
+addressObject OBJECT-TYPE SYNTAX NetworkAddress ACCESS read-only STATUS mandatory ::= { enterprises 53 3 }
+tableObject OBJECT-TYPE SYNTAX SEQUENCE OF TableEntry MAX-ACCESS not-accessible STATUS current DESCRIPTION "" ::= { enterprises 53 4 }
+qualifiedObject OBJECT-TYPE SYNTAX SNMPv2-TC.DisplayString MAX-ACCESS read-only STATUS current DESCRIPTION "" ::= { enterprises 53 5 }
+localQualified OBJECT-TYPE SYNTAX TYPES-MIB.LocalHex MAX-ACCESS read-only STATUS current DESCRIPTION "" ::= { enterprises 53 6 }
+LocalHex ::= TEXTUAL-CONVENTION DISPLAY-HINT "1x" STATUS current DESCRIPTION "" SYNTAX OCTET STRING
+END
+"#,
+        );
+
+        let unsigned = syntax_of(&resolver, "1.3.6.1.4.1.53.1.0");
+        assert_eq!(unsigned.base, BaseSyntax::Unsigned);
+        assert_eq!(unsigned.named_numbers, vec![(1, "low".to_string())]);
+        assert_eq!(
+            syntax_of(&resolver, "1.3.6.1.4.1.53.2.0").base,
+            BaseSyntax::Unsigned
+        );
+        assert_eq!(
+            syntax_of(&resolver, "1.3.6.1.4.1.53.3.0").base,
+            BaseSyntax::NetworkAddress
+        );
+        assert!(resolver.value_syntax("1.3.6.1.4.1.53.4").is_none());
+        assert_eq!(
+            syntax_of(&resolver, "1.3.6.1.4.1.53.5.0")
+                .display_hint
+                .as_deref(),
+            Some("255a")
+        );
+        assert_eq!(
+            syntax_of(&resolver, "1.3.6.1.4.1.53.6.0")
+                .display_hint
+                .as_deref(),
+            Some("1x")
         );
     }
 }

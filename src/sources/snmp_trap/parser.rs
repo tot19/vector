@@ -14,7 +14,10 @@ use vector_lib::{
     lookup::event_path,
 };
 
-use super::mib::{MibResolver, OidResolution};
+use super::{
+    display::{display_hex, display_value},
+    mib::{MibResolver, OidResolution},
+};
 
 pub(crate) const MAX_SNMP_MESSAGE_SIZE: usize = 65_507;
 
@@ -600,6 +603,7 @@ fn format_varbinds(
         .iter()
         .enumerate()
         .map(|(index, variable)| {
+            let oid = variable.oid.to_string();
             let raw = raw_varbinds.values.get(index);
             // snmp-parser decodes zero-length OCTET STRINGs as empty values.
             let empty_string = VarBindValue::Value(ObjectSyntax::String(&[]));
@@ -609,19 +613,26 @@ fn format_varbinds(
                 }
                 (value, _) => value,
             };
-            let formatted = match (value, raw) {
+            let (formatted, value_display) = match (value, raw) {
                 // snmp-parser decodes any tag number 5 as NULL regardless of its class, so
                 // recover values such as `[APPLICATION 5]` NsapAddress from the raw encoding.
                 (VarBindValue::Unspecified, Some(raw)) if raw.tag != 0x05 => {
-                    format_misparsed_null(raw)
+                    (format_misparsed_null(raw), display_hex(raw.content))
                 }
-                (value, _) => format_varbind_value(value),
+                (value, _) => (
+                    format_varbind_value(value),
+                    display_value(
+                        value,
+                        mib_resolver.value_syntax(&oid).as_deref(),
+                        mib_resolver,
+                    ),
+                ),
             };
-            let oid = variable.oid.to_string();
             let mut varbind = serde_json::Map::from_iter([
                 ("oid".to_string(), json!(oid)),
                 ("type".to_string(), json!(formatted.value_type)),
                 ("value".to_string(), json!(formatted.value)),
+                ("value_display".to_string(), json!(value_display)),
             ]);
 
             if let Some(value_bytes_hex) = formatted.value_bytes_hex {
@@ -2076,6 +2087,54 @@ END
     }
 
     #[test]
+    fn test_value_display_uses_mib_syntax() {
+        let resolver = MibResolver::from_str(
+            r#"
+DISPLAY-MIB DEFINITIONS ::= BEGIN
+IMPORTS OBJECT-TYPE, enterprises FROM SNMPv2-SMI MacAddress FROM SNMPv2-TC;
+operStatus OBJECT-TYPE
+    SYNTAX INTEGER { up(1), down(2) }
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "An enumeration."
+    ::= { enterprises 52 1 }
+physAddress OBJECT-TYPE
+    SYNTAX MacAddress
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "A hinted string."
+    ::= { enterprises 52 2 }
+END
+"#,
+        );
+        let mut varbinds = required_notification_varbinds();
+        varbinds.push(varbind(&[1, 3, 6, 1, 4, 1, 52, 1, 3], integer(2)));
+        varbinds.push(varbind(
+            &[1, 3, 6, 1, 4, 1, 52, 2, 3],
+            octet_string(&[0x00, 0x1a, 0x2b, 0x3c, 0x4d, 0x5e]),
+        ));
+
+        let parsed = parse_snmp_trap(
+            &v2c_message(PduType::TrapV2, 1, varbinds),
+            source_addr(),
+            &resolver,
+            &CommunityFilter::default(),
+        )
+        .unwrap();
+
+        let varbinds = parsed.events[0].as_log()["varbinds"].as_array().unwrap();
+        let display = |index: usize| varbinds[index].get(path!("value_display")).cloned();
+        assert_eq!(display(0), Some(Value::from("(123456) 0:20:34.56")));
+        assert_eq!(
+            display(1),
+            Some(Value::from("SNMPv2-SMI::enterprises.8072.2.3.0.1"))
+        );
+        assert_eq!(display(2), Some(Value::from("down(2)")));
+        assert_eq!(varbinds[2].get(path!("value")), Some(&Value::from("2")));
+        assert_eq!(display(3), Some(Value::from("0:1a:2b:3c:4d:5e")));
+    }
+
+    #[test]
     fn test_empty_octet_strings_are_not_reported_as_null() {
         let mut varbinds = required_notification_varbinds();
         varbinds.push(varbind(&[1, 3, 6, 1, 4, 1, 1, 1], octet_string(&[])));
@@ -2093,7 +2152,9 @@ END
         let field = |index: usize, name: &str| varbinds[index].get(path!(name)).cloned();
         assert_eq!(field(2, "type"), Some(Value::from("octet_string")));
         assert_eq!(field(2, "value"), Some(Value::from("")));
+        assert_eq!(field(2, "value_display"), Some(Value::from("\"\"")));
         assert_eq!(field(3, "type"), Some(Value::from("unspecified")));
+        assert_eq!(field(3, "value_display"), Some(Value::from("NULL")));
     }
 
     mod robustness {

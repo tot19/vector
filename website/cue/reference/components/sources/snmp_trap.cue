@@ -252,6 +252,13 @@ components: sources: snmp_trap: {
 						required:    true
 						type: string: {}
 					}
+					value_display: {
+						description: "The value as Net-SNMP's `snmptrapd` prints it, using the object's MIB syntax: enumeration labels, BITS labels, display hints, and units."
+						required:    true
+						type: string: {
+							examples: ["down(2)", "0:1a:2b:3c:4d:5e", "(123456) 0:20:34.56", "\"eth0\"", "42 seconds"]
+						}
+					}
 					value_bytes_hex: {
 						description: "The original bytes for OCTET STRING and other binary SNMP values, encoded as lowercase hexadecimal."
 						required:    false
@@ -337,8 +344,9 @@ components: sources: snmp_trap: {
 				trap_oid_symbol: "testTrap"
 				uptime:          123456
 				varbinds: [
-					{oid: "1.3.6.1.2.1.1.3.0", oid_name: "SNMPv2-MIB::sysUpTime.0", oid_module: "SNMPv2-MIB", oid_symbol: "sysUpTime", oid_instance: "0", type: "timeticks", value: "123456"},
-					{oid: "1.3.6.1.6.3.1.1.4.1.0", oid_name: "SNMPv2-MIB::snmpTrapOID.0", oid_module: "SNMPv2-MIB", oid_symbol: "snmpTrapOID", oid_instance: "0", type: "object_identifier", value: "1.3.6.1.4.1.8072.2.3.0.1", value_oid_name: "TEST-MIB::testTrap", value_oid_module: "TEST-MIB", value_oid_symbol: "testTrap"},
+					{oid: "1.3.6.1.2.1.1.3.0", oid_name: "SNMPv2-MIB::sysUpTime.0", oid_module: "SNMPv2-MIB", oid_symbol: "sysUpTime", oid_instance: "0", type: "timeticks", value: "123456", value_display: "(123456) 0:20:34.56"},
+					{oid: "1.3.6.1.6.3.1.1.4.1.0", oid_name: "SNMPv2-MIB::snmpTrapOID.0", oid_module: "SNMPv2-MIB", oid_symbol: "snmpTrapOID", oid_instance: "0", type: "object_identifier", value: "1.3.6.1.4.1.8072.2.3.0.1", value_display: "TEST-MIB::testTrap", value_oid_name: "TEST-MIB::testTrap", value_oid_module: "TEST-MIB", value_oid_symbol: "testTrap"},
+					{oid: "1.3.6.1.2.1.2.2.1.8.3", oid_name: "IF-MIB::ifOperStatus.3", oid_module: "IF-MIB", oid_symbol: "ifOperStatus", oid_instance: "3", type: "integer", value: "2", value_display: "down(2)"},
 				]
 				message:     "SNMPv2c trap from 192.168.1.100:49152: 1.3.6.1.4.1.8072.2.3.0.1"
 				host:        "192.168.1.100"
@@ -417,6 +425,24 @@ components: sources: snmp_trap: {
 				value types.
 				Vector preserves numeric OIDs as received. When MIBs are configured, Vector adds
 				resolved names in separate fields for varbind OIDs and ObjectIdentifier values.
+				"""
+		}
+
+		value_display: {
+			title: "Displayed Values"
+			body: """
+				Each varbind's `value_display` field holds the value exactly as Net-SNMP's
+				`snmptrapd` prints it after the type label, while `value` keeps the raw value. The
+				object's MIB `SYNTAX` is used when it is known: enumerations become `down(2)`,
+				BITS list the names of set bits, textual convention display hints such as
+				`MacAddress` and `DateAndTime` format strings (`0:1a:2b:3c:4d:5e`,
+				`2025-9-26,12:30:45.0`), and `UNITS` are appended (`42 seconds`). Without MIB
+				information, printable strings are quoted, other strings are shown as
+				hexadecimal, and TimeTicks include a duration such as `(123456) 0:20:34.56`.
+
+				Core SNMPv2-TC textual conventions are built in, so common types display
+				correctly even when that module is not loaded. Values whose type does not match
+				the MIB syntax are displayed from the value alone.
 				"""
 		}
 
