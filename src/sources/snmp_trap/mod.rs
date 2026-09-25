@@ -8,7 +8,7 @@ use vector_lib::{
     config::{LegacyKey, LogNamespace, log_schema},
     configurable::configurable_component,
     internal_event::{ByteSize, BytesReceived, InternalEventHandle as _, Protocol},
-    lookup::{OwnedValuePath, lookup_v2::OptionalValuePath, owned_value_path, path},
+    lookup::{OwnedValuePath, event_path, lookup_v2::OptionalValuePath, owned_value_path, path},
     sensitive_string::SensitiveString,
 };
 use vrl::value::{Kind, kind::Collection};
@@ -80,6 +80,13 @@ pub struct SnmpTrapConfig {
     #[configurable(metadata(docs::examples = "communities_example()"))]
     communities: Option<Vec<SensitiveString>>,
 
+    /// Whether to include the SNMP community string in each event's `community` field.
+    ///
+    /// Community strings act as passwords for SNMPv1 and SNMPv2c and are often the same
+    /// credentials used to read from or write to devices, so they are omitted by default.
+    #[serde(default)]
+    include_community: bool,
+
     /// The namespace to use for logs. This overrides the global setting.
     #[configurable(metadata(docs::hidden))]
     #[serde(default)]
@@ -132,7 +139,15 @@ impl SnmpTrapConfig {
         .with_event_field(&owned_value_path!("snmp_version"), Kind::bytes(), None)
         .with_event_field(&owned_value_path!("pdu_type"), Kind::bytes(), None)
         .with_event_field(&owned_value_path!("source_address"), Kind::bytes(), None)
-        .with_event_field(&owned_value_path!("community"), Kind::bytes(), None)
+        .with_event_field(
+            &owned_value_path!("community"),
+            if self.include_community {
+                Kind::bytes()
+            } else {
+                Kind::bytes().or_undefined()
+            },
+            None,
+        )
         .with_event_field(
             &owned_value_path!("enterprise_oid"),
             Kind::bytes().or_undefined(),
@@ -234,6 +249,7 @@ impl Default for SnmpTrapConfig {
             host_key: None,
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         }
     }
@@ -273,6 +289,7 @@ impl SourceConfig for SnmpTrapConfig {
             host_key,
             mib_resolver,
             self.community_filter(),
+            self.include_community,
             cx.shutdown,
             log_namespace,
             cx.out,
@@ -306,6 +323,7 @@ async fn snmp_trap_udp(
     host_key: Option<OwnedValuePath>,
     mib_resolver: MibResolver,
     communities: CommunityFilter,
+    include_community: bool,
     shutdown: ShutdownSignal,
     log_namespace: LogNamespace,
     mut out: SourceSender,
@@ -353,7 +371,13 @@ async fn snmp_trap_udp(
                             count,
                         });
 
-                        enrich_events(&mut notification.events, &host_key, peer_addr, log_namespace);
+                        enrich_events(
+                            &mut notification.events,
+                            &host_key,
+                            peer_addr,
+                            include_community,
+                            log_namespace,
+                        );
 
                         tokio::select! {
                             result = out.send_batch(notification.events) => {
@@ -407,12 +431,17 @@ fn enrich_events(
     events: &mut [Event],
     host_key: &Option<OwnedValuePath>,
     peer_addr: std::net::SocketAddr,
+    include_community: bool,
     log_namespace: LogNamespace,
 ) {
     for event in events {
         let Event::Log(log) = event else {
             continue;
         };
+
+        if !include_community {
+            log.remove(event_path!("community"));
+        }
 
         log_namespace.insert_standard_vector_source_metadata(log, SnmpTrapConfig::NAME, Utc::now());
         log_namespace.insert_source_metadata(
@@ -477,6 +506,7 @@ mod tests {
             host_key: None,
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -499,6 +529,7 @@ mod tests {
             host_key: None,
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -531,6 +562,7 @@ mod tests {
             host_key: Some(OptionalValuePath::from(host_path)),
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -551,6 +583,7 @@ mod tests {
             host_key: None,
             mib_paths: vec![temp_dir.path().join("missing")],
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -573,6 +606,7 @@ mod tests {
                 host_key: None,
                 mib_paths: Vec::new(),
                 communities: None,
+                include_community: false,
                 log_namespace: None,
             };
 
@@ -620,6 +654,7 @@ mod tests {
             host_key: Some(OptionalValuePath::from(host_path)),
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -661,6 +696,7 @@ mod tests {
             host_key: Some(OptionalValuePath::none()),
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -702,6 +738,7 @@ mod tests {
                 host_key: None,
                 mib_paths: Vec::new(),
                 communities: Some(vec![SensitiveString::from("secret".to_string())]),
+                include_community: false,
                 log_namespace: None,
             };
 
@@ -752,6 +789,7 @@ mod tests {
                 host_key: None,
                 mib_paths: Vec::new(),
                 communities: None,
+                include_community: false,
                 log_namespace: Some(log_namespace == LogNamespace::Vector),
             };
             let definition = config
@@ -808,6 +846,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_community_is_only_included_when_enabled() {
+        for include_community in [false, true] {
+            let (_guard, addr) = next_addr();
+            let config = SnmpTrapConfig {
+                address: SocketListenAddr::SocketAddr(addr),
+                include_community,
+                ..SnmpTrapConfig::default()
+            };
+            let definition = config
+                .outputs(LogNamespace::Legacy)
+                .remove(0)
+                .schema_definition(true)
+                .unwrap();
+
+            let key = ComponentKey::from("snmp_trap");
+            let (tx, mut rx) = SourceSender::new_test();
+            let (context, shutdown) = SourceContext::new_shutdown(&key, tx);
+            let shutdown_complete = shutdown.shutdown_tripwire();
+            tokio::spawn(config.build(context).await.unwrap());
+
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            for message in [v1_trap(), v2c_notification(PduType::InformRequest)] {
+                socket.send_to(&message, addr).await.unwrap();
+                let event = timeout(Duration::from_secs(2), rx.next())
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+                definition.assert_valid_for_event(&event);
+                assert_eq!(
+                    event.as_log().get(event_path!("community")),
+                    include_community.then(|| "public".into()).as_ref(),
+                    "include_community = {include_community}"
+                );
+            }
+
+            shutdown
+                .shutdown_all(Some(Instant::now() + Duration::from_millis(100)))
+                .await;
+            shutdown_complete.await;
+        }
+    }
+
+    #[tokio::test]
     async fn test_udp_source_acknowledges_inform_request() {
         let (_guard, addr) = next_addr();
         let config = SnmpTrapConfig {
@@ -816,6 +898,7 @@ mod tests {
             host_key: None,
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -871,6 +954,7 @@ mod tests {
             host_key: None,
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -913,6 +997,7 @@ mod tests {
             host_key: None,
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -956,6 +1041,7 @@ mod tests {
             host_key: None,
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -1014,6 +1100,7 @@ mod tests {
             host_key: None,
             mib_paths: vec![temp_dir.path().to_path_buf()],
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -1066,6 +1153,7 @@ mod tests {
             host_key: None,
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 
@@ -1116,6 +1204,7 @@ mod tests {
             host_key: None,
             mib_paths: Vec::new(),
             communities: None,
+            include_community: false,
             log_namespace: None,
         };
 

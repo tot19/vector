@@ -81,8 +81,8 @@ components: sources: snmp_trap: {
 				}
 			}
 			community: {
-				description: "The SNMP community string from the trap message."
-				required:    true
+				description: "The SNMP community string from the message. Only present when `include_community` is enabled."
+				required:    false
 				type: string: {
 					examples: ["public", "private"]
 				}
@@ -330,7 +330,6 @@ components: sources: snmp_trap: {
 				snmp_version:    "2c"
 				pdu_type:        "trap_v2"
 				source_address:  "192.168.1.100:49152"
-				community:       "public"
 				request_id:      12345
 				trap_oid:        "1.3.6.1.4.1.8072.2.3.0.1"
 				trap_oid_name:   "TEST-MIB::testTrap"
@@ -393,9 +392,13 @@ components: sources: snmp_trap: {
 				`component_errors_total` with `error_type` set to `authentication_failed`.
 				Messages whose community string is not valid UTF-8 are rejected as parse errors.
 
-				SNMP community strings are included in the parsed output. SNMPv1 and SNMPv2c
-				community strings are sent in plaintext and provide minimal security, so use
-				network-level security measures as well when receiving SNMP traps.
+				Community strings are omitted from events by default, because they act as
+				passwords for SNMPv1 and SNMPv2c and are often the same credentials used to read
+				from or write to devices. Set `include_community` to add them in the `community`
+				field, for example to route events by community.
+
+				SNMPv1 and SNMPv2c community strings are sent in plaintext and provide minimal
+				security, so use network-level security measures as well when receiving SNMP traps.
 				"""
 		}
 

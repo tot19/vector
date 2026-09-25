@@ -4,3 +4,4 @@ sources:
     address: 0.0.0.0:9000
     communities:
       - public
+    include_community: false

@@ -23,6 +23,8 @@ sources:
     # Optional: only accept messages that use one of these community strings.
     # communities:
     #   - "public"
+    # Optional: add the community string to each event's `community` field.
+    # include_community: true
     # Optional: Set receive buffer size
     receive_buffer_bytes: 65536
 

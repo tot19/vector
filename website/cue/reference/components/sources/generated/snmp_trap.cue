@@ -38,6 +38,16 @@ generated: components: sources: snmp_trap: configuration: {
 		required: false
 		type: string: {}
 	}
+	include_community: {
+		description: """
+			Whether to include the SNMP community string in each event's `community` field.
+
+			Community strings act as passwords for SNMPv1 and SNMPv2c and are often the same
+			credentials used to read from or write to devices, so they are omitted by default.
+			"""
+		required: false
+		type: bool: default: false
+	}
 	mib_paths: {
 		description: """
 			MIB files or directories to load for OID name resolution.
